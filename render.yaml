@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: almuerzobot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    plan: free
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: WHATSAPP_TOKEN
+        sync: false
+      - key: WHATSAPP_PHONE_NUMBER_ID
+        sync: false
+      - key: WHATSAPP_VERIFY_TOKEN
+        sync: false
+      - key: GOOGLE_SHEETS_ID
+        value: 1mYVizMR567guLlUAkzYyiTdasLL2j2feIyfY37rUTOs
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false
