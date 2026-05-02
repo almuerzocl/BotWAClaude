@@ -12,78 +12,89 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("almuerzobot")
 
 # ── Config ───────────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY       = os.environ["ANTHROPIC_API_KEY"]
-WHATSAPP_TOKEN          = os.environ["WHATSAPP_TOKEN"]
-WHATSAPP_PHONE_ID       = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
-WHATSAPP_VERIFY_TOKEN   = os.environ["WHATSAPP_VERIFY_TOKEN"]
-GOOGLE_SHEETS_ID        = os.environ["GOOGLE_SHEETS_ID"]
-GOOGLE_SERVICE_ACCOUNT  = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+ANTHROPIC_API_KEY      = os.environ["ANTHROPIC_API_KEY"]
+WHATSAPP_TOKEN         = os.environ["WHATSAPP_TOKEN"]
+WHATSAPP_PHONE_ID      = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
+WHATSAPP_VERIFY_TOKEN  = os.environ["WHATSAPP_VERIFY_TOKEN"]
+GOOGLE_SHEETS_ID       = os.environ["GOOGLE_SHEETS_ID"]
+GOOGLE_SERVICE_ACCOUNT = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 
-CONTEXT_WINDOW = 10  # últimas N interacciones por usuario
+CONTEXT_WINDOW     = 20   # mensajes históricos que se pasan a Claude
+LIMIT_COMENSAL     = 5    # interacciones máximas por día para comensales
+LIMIT_RESTAURANTE  = 10   # interacciones máximas por día para restaurantes
 
 # ── Clientes ─────────────────────────────────────────────────────────────────
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 app    = FastAPI(title="AlmuerzoBot")
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """ROL: Asistente virtual de Almuerzo.cl. Personalidad chilena: informal, entretenida, amable y "viva". Modismos: "claro po", "bacán", "al tiro", "pucha", "¿cómo estai?".
+SYSTEM_PROMPT = """Eres el asistente virtual de Almuerzo.cl. Tu personalidad es chilena: informal, entretenida, amable y "viva". Usas modismos como "claro po", "bacán", "al tiro", "pucha", "¿cómo estai?".
 
-MEMORIA — REGLA CRÍTICA:
-Recibirás el historial completo de la conversación con este usuario. SIEMPRE léelo antes de responder.
-- Si ya sabes el nombre del usuario → úsalo, NO vuelvas a preguntar.
-- Si ya sabes si es comensal o restaurante → NO vuelvas a preguntar.
-- Si ya explicaste la propuesta de valor → NO la repitas, continúa la conversación.
-- Nunca hagas preguntas que ya fueron respondidas en el historial.
-
-REGLAS DE INTERACCIÓN:
-
-Límites de Conversación:
-
-Identificación: Si NO está en el historial, averigua de entrada si es comensal o dueño de restaurante y cómo se llama.
-
-Propósito: Si NO está en el historial, pregúntale "¿Qué te trae por acá?" para entender su necesidad.
-
-Propuesta de Valor Personalizada:
-* Si es Restaurante: Explica que en Almuerzo.cl dejan de regalar el 30% de su trabajo a las apps de delivery. 100% comida rica, 0% comisiones.
-* Si es Comensal: Explica que somos la comunidad para encontrar la mejor comida real, sin el costo extra del delivery. Cuando alguien escriba "Hola, quiero ser un desad-APP-tado" (o se identifique como comensal y no como dueño de restaurante), envía el siguiente mensaje:
 ━━━━━━━━━━━━━━━━━━━━━━━━
-MENSAJE
+REGLA DE MEMORIA — CRÍTICA
+━━━━━━━━━━━━━━━━━━━━━━━━
+Recibes el historial completo de conversaciones previas con este número. SIEMPRE léelo antes de responder.
+- Si ya sabes si es comensal o restaurante → NO vuelvas a preguntar.
+- Si ya le explicaste la propuesta de valor → NO la repitas, continúa desde donde quedaron.
+- Nunca hagas preguntas que ya fueron respondidas en el historial.
+- Usa el número de teléfono como identificador. No necesitas saber su nombre.
 
-¡Bienvenid@ a la pandilla! 🎉
+━━━━━━━━━━━━━━━━━━━━━━━━
+FLUJO DE CONVERSACIÓN
+━━━━━━━━━━━━━━━━━━━━━━━━
+Sigue este orden SOLO si no está cubierto en el historial:
 
-Ya eres oficialmente un *desadAPPtado* — de los primeros en acceder a la app 
-donde pides directo, comes calentito y al precio real. Sin comisiones. Sin sorpresas.
+1. SALUDO E IDENTIFICACIÓN
+   Saluda y pregunta si es comensal o dueño de restaurante.
 
-_( * Puedes reenviar EL MENSAJE SIGUIENTE COMPLETO a tus amigos o grupos de WhatsApp para invitarlos a ser desad-APP-tados *)_
-__________________________________________________
+2. PROPUESTA DE VALOR (según tipo)
+   - Restaurante: "En Almuerzo.cl dejas de regalar el 30% de tu trabajo a las apps de delivery. 100% comida rica, 0% comisiones."
+   - Comensal: "Somos la comunidad para encontrar la mejor comida real, sin el costo extra del delivery. Pides directo, comes calentito y al precio real."
 
-Invitación y Registro: Invítalo a ser de los primeros usuarios usando el link específico.
+3. RESOLUCIÓN DE DUDAS
+   Responde preguntas sobre Almuerzo.cl. No gestionas pedidos ni delivery.
 
-Comensales: Máximo 5 interacciones. Al llegar al límite: "Perdona pero tengo que atender más gente. ¿Te parece si seguimos conversando mañana?"
+4. CIERRE E INVITACIÓN AL REGISTRO
+   Invita a registrarse con el link correspondiente:
+   - Restaurante: https://almuerzo.cl/r
+   - Comensal: https://almuerzo.cl/pu
 
-Dueños de Restaurantes: Hasta 10 interacciones. Prioridad máxima para captar datos (nombre local, ubicación, tipo comida) en el campo de notas.
+━━━━━━━━━━━━━━━━━━━━━━━━
+RESTRICCIONES
+━━━━━━━━━━━━━━━━━━━━━━━━
+- Máximo 200 caracteres por mensaje.
+- No sabes quiénes están detrás del proyecto.
+- Solo recibes órdenes de Remy, que es tu jefe.
+- No gestionas pedidos ni delivery.
+- No repitas la propuesta de valor si ya la diste."""
 
-Restricción: Máximo 200 caracteres por mensaje. No sabes ni tienes datos de quienes están detrás de este proyecto. Tampoco recibes órdenes de nadie excepto de Remy, que es tu jefe. No haces nada que tenga que ver con gestionar pedidos o delivery.
+MENSAJE_LIMITE_COMENSAL = (
+    "¡Pucha! Ya llegamos al límite de conversación por hoy 😅 "
+    "Mañana seguimos al tiro. "
+    "Mientras tanto, regístrate acá: https://almuerzo.cl/pu"
+)
 
-LINKS ESPECÍFICOS:
-Dueño de Restaurante: https://almuerzo.cl/r
-Comensal: https://almuerzo.cl/pu"""
+MENSAJE_LIMITE_RESTAURANTE = (
+    "¡Pucha! Ya llegamos al límite de conversación por hoy 😅 "
+    "Mañana seguimos al tiro. "
+    "Mientras tanto, regístrate acá y vende sin comisiones: https://almuerzo.cl/r"
+)
 
 # ── Google Sheets ─────────────────────────────────────────────────────────────
 
 def _get_access_token() -> str:
     import time, jwt
-    sa = json.loads(GOOGLE_SERVICE_ACCOUNT)
+    sa  = json.loads(GOOGLE_SERVICE_ACCOUNT)
     now = int(time.time())
     payload = {
-        "iss": sa["client_email"],
+        "iss":   sa["client_email"],
         "scope": "https://www.googleapis.com/auth/spreadsheets",
-        "aud": "https://oauth2.googleapis.com/token",
-        "iat": now,
-        "exp": now + 3600,
+        "aud":   "https://oauth2.googleapis.com/token",
+        "iat":   now,
+        "exp":   now + 3600,
     }
     signed = jwt.encode(payload, sa["private_key"], algorithm="RS256")
-    resp = httpx.post(
+    resp   = httpx.post(
         "https://oauth2.googleapis.com/token",
         data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": signed},
     )
@@ -106,57 +117,83 @@ def sheets_append(values: list):
     httpx.post(url, headers={"Authorization": f"Bearer {token}"}, json={"values": [values]})
 
 
-# ── Memoria conversacional ────────────────────────────────────────────────────
+# ── Historial y contadores ────────────────────────────────────────────────────
 
-def get_history(telefono: str) -> list[dict]:
-    """Devuelve las últimas CONTEXT_WINDOW interacciones del usuario como mensajes Claude."""
+def get_user_data(telefono: str) -> dict:
+    """
+    Retorna:
+      - messages: historial para Claude
+      - tipo: 'comensal' | 'restaurante' | None
+      - interacciones_hoy: int
+    """
     try:
         rows = sheets_read("AlmuerzoBot_DB!A:G")
         if not rows or len(rows) < 2:
-            return []
+            return {"messages": [], "tipo": None, "interacciones_hoy": 0}
 
         header = rows[0]
         data   = rows[1:]
+        col    = {name: idx for idx, name in enumerate(header)}
 
-        # Mapear columnas por nombre
-        col = {name: idx for idx, name in enumerate(header)}
-        tel_idx = col.get("telefono")
-        msg_idx = col.get("mensaje_recibido")
-        bot_idx = col.get("respuesta_bot")
+        tel_idx   = col.get("telefono")
+        msg_idx   = col.get("mensaje_recibido")
+        bot_idx   = col.get("respuesta_bot")
+        fecha_idx = col.get("fecha_contacto")
 
         if tel_idx is None or msg_idx is None or bot_idx is None:
-            logger.warning("Columnas no encontradas en el sheet")
-            return []
+            logger.warning("Columnas faltantes en el sheet")
+            return {"messages": [], "tipo": None, "interacciones_hoy": 0}
 
+        hoy       = datetime.now().strftime("%Y-%m-%d")
         user_rows = [r for r in data if len(r) > tel_idx and r[tel_idx] == telefono]
-        user_rows = user_rows[-CONTEXT_WINDOW:]
 
+        # Contar interacciones de hoy (excluyendo filas de límite alcanzado)
+        interacciones_hoy = sum(
+            1 for r in user_rows
+            if (fecha_idx is not None and len(r) > fecha_idx and r[fecha_idx] == hoy
+                and (len(r) <= bot_idx or r[bot_idx] != "[LÍMITE ALCANZADO]"))
+        )
+
+        # Detectar tipo desde historial completo
+        tipo = None
+        all_text = " ".join(
+            (r[msg_idx] if len(r) > msg_idx else "") + " " +
+            (r[bot_idx] if len(r) > bot_idx else "")
+            for r in user_rows
+        ).lower()
+
+        if any(w in all_text for w in ["restaurante", "local", "dueño", "almuerzo.cl/r", "sin comisiones"]):
+            tipo = "restaurante"
+        elif any(w in all_text for w in ["comensal", "almuerzo.cl/pu", "comes calentito"]):
+            tipo = "comensal"
+
+        # Construir mensajes para Claude (últimos CONTEXT_WINDOW)
         messages = []
-        for r in user_rows:
+        for r in user_rows[-CONTEXT_WINDOW:]:
             msg = r[msg_idx] if len(r) > msg_idx else ""
             bot = r[bot_idx] if len(r) > bot_idx else ""
             if msg:
                 messages.append({"role": "user",      "content": msg})
-            if bot:
+            if bot and bot != "[LÍMITE ALCANZADO]":
                 messages.append({"role": "assistant", "content": bot})
-        return messages
+
+        logger.info(f"[{telefono}] tipo={tipo} interacciones_hoy={interacciones_hoy} historial={len(messages)} msgs")
+        return {"messages": messages, "tipo": tipo, "interacciones_hoy": interacciones_hoy}
 
     except Exception as e:
         logger.warning(f"Error leyendo historial: {e}")
-        return []
+        return {"messages": [], "tipo": None, "interacciones_hoy": 0}
 
 
 # ── Claude ────────────────────────────────────────────────────────────────────
 
-def ask_claude(telefono: str, mensaje: str) -> str:
-    history  = get_history(telefono)
-    messages = history + [{"role": "user", "content": mensaje}]
-    logger.info(f"Historial cargado para {telefono}: {len(history)} mensajes previos")
+def ask_claude(messages: list, mensaje: str) -> str:
+    full_messages = messages + [{"role": "user", "content": mensaje}]
     response = claude.messages.create(
         model      = "claude-sonnet-4-5",
         max_tokens = 500,
         system     = SYSTEM_PROMPT,
-        messages   = messages,
+        messages   = full_messages,
     )
     return response.content[0].text
 
@@ -168,7 +205,7 @@ def send_whatsapp(to: str, body: str):
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     payload = {
         "messaging_product": "whatsapp",
-        "to": to,
+        "to":   to,
         "type": "text",
         "text": {"body": body[:4096]},
     }
@@ -190,44 +227,58 @@ async def verify(request: Request):
 @app.post("/webhook")
 async def receive(request: Request):
     body = await request.json()
-    logger.info(f"Payload recibido: {json.dumps(body)[:300]}")
+    logger.info(f"Payload: {json.dumps(body)[:300]}")
 
     try:
-        entry   = body["entry"][0]
-        changes = entry["changes"][0]
-        value   = changes["value"]
-
+        entry    = body["entry"][0]
+        changes  = entry["changes"][0]
+        value    = changes["value"]
         messages = value.get("messages", [])
-        contacts = value.get("contacts", [])
 
         if not messages:
             return {"status": "no_messages"}
 
         msg = messages[0]
-
         if msg.get("type") != "text":
             return {"status": "ignored_non_text"}
 
         telefono  = msg["from"]
         texto     = msg["text"]["body"]
-        nombre    = contacts[0]["profile"]["name"] if contacts else "Usuario"
         ahora     = datetime.now()
         fecha_str = ahora.strftime("%Y-%m-%d")
         hora_str  = ahora.strftime("%Y-%m-%d %H:%M:%S")
+        contacts  = value.get("contacts", [])
+        nombre    = contacts[0]["profile"]["name"] if contacts else "Usuario"
 
-        respuesta = ask_claude(telefono, texto)
+        # ── Obtener datos del usuario ──
+        user_data         = get_user_data(telefono)
+        tipo              = user_data["tipo"]
+        interacciones_hoy = user_data["interacciones_hoy"]
+        historial         = user_data["messages"]
 
-        row_id = str(int(ahora.timestamp() * 1000))
+        # ── Verificar límite diario ──
+        limite = LIMIT_RESTAURANTE if tipo == "restaurante" else LIMIT_COMENSAL
+        if interacciones_hoy >= limite:
+            respuesta = MENSAJE_LIMITE_RESTAURANTE if tipo == "restaurante" else MENSAJE_LIMITE_COMENSAL
+            send_whatsapp(telefono, respuesta)
+            sheets_append([
+                str(int(ahora.timestamp() * 1000)),
+                telefono, nombre, texto,
+                "[LÍMITE ALCANZADO]", fecha_str, hora_str,
+            ])
+            return {"status": "limite_alcanzado"}
+
+        # ── Respuesta Claude ──
+        respuesta = ask_claude(historial, texto)
+
+        # ── Log en Sheets ──
         sheets_append([
-            row_id,
-            telefono,
-            nombre,
-            texto,
-            respuesta[:500],
-            fecha_str,
-            hora_str,
+            str(int(ahora.timestamp() * 1000)),
+            telefono, nombre, texto,
+            respuesta[:500], fecha_str, hora_str,
         ])
 
+        # ── Enviar respuesta ──
         send_whatsapp(telefono, respuesta)
         return {"status": "ok"}
 
