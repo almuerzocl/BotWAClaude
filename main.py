@@ -308,7 +308,14 @@ async def receive(request: Request, background_tasks: BackgroundTasks):
             return {"status": "no_messages"}
 
         msg = messages[0]
+
         if msg.get("type") != "text":
+            # Reply so the user knows we only handle text, and Meta gets 200 (no retry)
+            telefono = msg["from"]
+            background_tasks.add_task(
+                send_whatsapp, telefono,
+                "Solo puedo responder mensajes de texto por ahora 🙏"
+            )
             return {"status": "ignored_non_text"}
 
         msg_id = msg.get("id", "")
