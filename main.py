@@ -126,10 +126,14 @@ MENSAJE_LIMITE_RESTAURANTE = (
 
 # ── Google Sheets ─────────────────────────────────────────────────────────────
 
+_token_cache: dict = {"token": None, "exp": 0}
+
 def _get_access_token() -> str:
     import time, jwt
-    sa  = json.loads(GOOGLE_SERVICE_ACCOUNT)
     now = int(time.time())
+    if _token_cache["token"] and now < _token_cache["exp"] - 60:
+        return _token_cache["token"]
+    sa  = json.loads(GOOGLE_SERVICE_ACCOUNT)
     payload = {
         "iss":   sa["client_email"],
         "scope": "https://www.googleapis.com/auth/spreadsheets",
@@ -142,7 +146,10 @@ def _get_access_token() -> str:
         "https://oauth2.googleapis.com/token",
         data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": signed},
     )
-    return resp.json()["access_token"]
+    token = resp.json()["access_token"]
+    _token_cache["token"] = token
+    _token_cache["exp"]   = now + 3600
+    return token
 
 
 def sheets_read(range_: str) -> list:
