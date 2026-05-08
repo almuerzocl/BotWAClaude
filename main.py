@@ -7,6 +7,7 @@ from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import PlainTextResponse
 import anthropic
+import redis as redis_lib
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -28,18 +29,47 @@ LIMIT_RESTAURANTE  = 10   # interacciones máximas por día para restaurantes
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 app    = FastAPI(title="AlmuerzoBot")
 
-# ── Deduplicación de mensajes (evita doble respuesta por reintentos de Meta) ─
-# OrderedDict usado como LRU cache: guarda los últimos 500 IDs procesados.
+# ── Deduplicación de mensajes ─────────────────────────────────────────────────
+# Redis: lock atómico cross-process (Upstash free tier).
+# In-memory: fallback si no hay Redis configurado.
+_redis: redis_lib.Redis | None = None
+try:
+    _redis_url = os.environ.get("REDIS_URL", "")
+    if _redis_url:
+        _redis = redis_lib.from_url(_redis_url, decode_responses=True)
+        _redis.ping()
+        logger.info("Redis conectado para deduplicación")
+    else:
+        logger.warning("REDIS_URL no configurado — usando dedup solo en memoria")
+except Exception as _e:
+    logger.warning(f"Redis no disponible, usando dedup en memoria: {_e}")
+    _redis = None
+
 _processed_ids: OrderedDict[str, bool] = OrderedDict()
 _MAX_PROCESSED = 500
 
-def _already_processed(msg_id: str) -> bool:
-    if msg_id in _processed_ids:
+def _claim_message(msg_id: str) -> bool:
+    """
+    Intenta reclamar este msg_id. Retorna True si somos los primeros (procesar),
+    False si ya fue reclamado por otro proceso (ignorar).
+    Usa Redis SET NX EX para atomicidad cross-process.
+    Fallback a dict en memoria si no hay Redis.
+    """
+    if not msg_id:
         return True
+    if _redis is not None:
+        try:
+            # SET key 1 EX 300 NX: atómico, solo True para el primer llamador
+            return bool(_redis.set(msg_id, "1", ex=300, nx=True))
+        except Exception as e:
+            logger.warning(f"Redis error en claim: {e}")
+    # Fallback in-memory
+    if msg_id in _processed_ids:
+        return False
     _processed_ids[msg_id] = True
     if len(_processed_ids) > _MAX_PROCESSED:
         _processed_ids.popitem(last=False)
-    return False
+    return True
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """Eres el asistente virtual de Almuerzo.cl. Tu personalidad es chilena: informal, entretenida, amable y "viva". Usas modismos como "claro po", "bacán", "al tiro", "pucha", "¿cómo estai?".
@@ -250,9 +280,9 @@ def process_message(msg: dict, value: dict):
         contacts  = value.get("contacts", [])
         nombre    = contacts[0]["profile"]["name"] if contacts else "Usuario"
 
-        # Sheet-level dedup: catches cross-process / cross-instance duplicates
-        if _wamid_already_in_sheet(msg_id):
-            logger.info(f"Wamid ya en sheet, ignorado: {msg_id}")
+        # Redis atomic claim — cross-process dedup
+        if not _claim_message(msg_id):
+            logger.info(f"Wamid ya reclamado en process_message, ignorado: {msg_id}")
             return
 
         user_data         = get_user_data(telefono)
@@ -319,7 +349,7 @@ async def receive(request: Request, background_tasks: BackgroundTasks):
             return {"status": "ignored_non_text"}
 
         msg_id = msg.get("id", "")
-        if _already_processed(msg_id):
+        if not _claim_message(msg_id):
             logger.info(f"Mensaje duplicado ignorado: {msg_id}")
             return {"status": "duplicate"}
 
