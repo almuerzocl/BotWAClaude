@@ -280,10 +280,6 @@ def process_message(msg: dict, value: dict):
         contacts  = value.get("contacts", [])
         nombre    = contacts[0]["profile"]["name"] if contacts else "Usuario"
 
-        # Redis atomic claim — cross-process dedup
-        if not _claim_message(msg_id):
-            logger.info(f"Wamid ya reclamado en process_message, ignorado: {msg_id}")
-            return
 
         user_data         = get_user_data(telefono)
         tipo              = user_data["tipo"]
