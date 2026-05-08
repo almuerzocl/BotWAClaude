@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import httpx
 import logging
 from collections import OrderedDict
@@ -24,49 +25,40 @@ WHATSAPP_VERIFY_TOKEN  = os.environ["WHATSAPP_VERIFY_TOKEN"]
 GOOGLE_SHEETS_ID       = os.environ["GOOGLE_SHEETS_ID"]
 GOOGLE_SERVICE_ACCOUNT = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 
-CONTEXT_WINDOW     = 20   # mensajes históricos que se pasan a Claude
-LIMIT_COMENSAL     = 5    # interacciones máximas por día para comensales
-LIMIT_RESTAURANTE  = 10   # interacciones máximas por día para restaurantes
+CONTEXT_WINDOW     = 10   # últimos 10 intercambios (reducido para velocidad)
+LIMIT_COMENSAL     = 5
+LIMIT_RESTAURANTE  = 10
 
 # ── Clientes ─────────────────────────────────────────────────────────────────
-claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+claude = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+http   = httpx.AsyncClient(timeout=10)
 app    = FastAPI(title="AlmuerzoBot")
 
-# ── Deduplicación de mensajes ─────────────────────────────────────────────────
-# Redis: lock atómico cross-process (Upstash free tier).
-# In-memory: fallback si no hay Redis configurado.
+# ── Deduplicación ─────────────────────────────────────────────────────────────
 _redis = None
 try:
     _redis_url = os.environ.get("REDIS_URL", "")
     if _redis_url and redis_lib is not None:
         _redis = redis_lib.from_url(_redis_url, decode_responses=True)
         _redis.ping()
-        logger.info("Redis conectado para deduplicación")
+        logger.info("Redis conectado")
     else:
-        logger.warning("REDIS_URL no configurado — usando dedup solo en memoria")
+        logger.warning("REDIS_URL no configurado — dedup solo en memoria")
 except Exception as _e:
-    logger.warning(f"Redis no disponible, usando dedup en memoria: {_e}")
+    logger.warning(f"Redis no disponible: {_e}")
     _redis = None
 
 _processed_ids: OrderedDict[str, bool] = OrderedDict()
 _MAX_PROCESSED = 500
 
 def _claim_message(msg_id: str) -> bool:
-    """
-    Intenta reclamar este msg_id. Retorna True si somos los primeros (procesar),
-    False si ya fue reclamado por otro proceso (ignorar).
-    Usa Redis SET NX EX para atomicidad cross-process.
-    Fallback a dict en memoria si no hay Redis.
-    """
     if not msg_id:
         return True
     if _redis is not None:
         try:
-            # SET key 1 EX 300 NX: atómico, solo True para el primer llamador
             return bool(_redis.set(msg_id, "1", ex=300, nx=True))
         except Exception as e:
-            logger.warning(f"Redis error en claim: {e}")
-    # Fallback in-memory
+            logger.warning(f"Redis error: {e}")
     if msg_id in _processed_ids:
         return False
     _processed_ids[msg_id] = True
@@ -131,12 +123,12 @@ MENSAJE_LIMITE_RESTAURANTE = (
 
 _token_cache: dict = {"token": None, "exp": 0}
 
-def _get_access_token() -> str:
-    import time, jwt
+async def _get_access_token() -> str:
+    import jwt
     now = int(time.time())
     if _token_cache["token"] and now < _token_cache["exp"] - 60:
         return _token_cache["token"]
-    sa  = json.loads(GOOGLE_SERVICE_ACCOUNT)
+    sa = json.loads(GOOGLE_SERVICE_ACCOUNT)
     payload = {
         "iss":   sa["client_email"],
         "scope": "https://www.googleapis.com/auth/spreadsheets",
@@ -145,10 +137,9 @@ def _get_access_token() -> str:
         "exp":   now + 3600,
     }
     signed = jwt.encode(payload, sa["private_key"], algorithm="RS256")
-    resp   = httpx.post(
+    resp = await http.post(
         "https://oauth2.googleapis.com/token",
         data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": signed},
-        timeout=10,
     )
     token = resp.json()["access_token"]
     _token_cache["token"] = token
@@ -156,48 +147,30 @@ def _get_access_token() -> str:
     return token
 
 
-def sheets_read(range_: str) -> list:
-    token = _get_access_token()
+async def sheets_read(range_: str) -> list:
+    token = await _get_access_token()
     url   = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEETS_ID}/values/{range_}"
-    resp  = httpx.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+    resp  = await http.get(url, headers={"Authorization": f"Bearer {token}"})
     resp.raise_for_status()
     return resp.json().get("values", [])
 
 
-def sheets_append(values: list):
-    token = _get_access_token()
+async def sheets_append(values: list):
+    token = await _get_access_token()
     url   = (
         f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEETS_ID}"
         f"/values/AlmuerzoBot_DB!A:H:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS"
     )
-    resp = httpx.post(url, headers={"Authorization": f"Bearer {token}"}, json={"values": [values]}, timeout=10)
+    resp = await http.post(url, headers={"Authorization": f"Bearer {token}"}, json={"values": [values]})
     if resp.status_code != 200:
         logger.error(f"Sheets append error {resp.status_code}: {resp.text}")
 
 
-def _wamid_already_in_sheet(msg_id: str) -> bool:
-    """Cross-process dedup: check column H for this WhatsApp message ID."""
-    if not msg_id:
-        return False
-    try:
-        rows = sheets_read("AlmuerzoBot_DB!H:H")
-        return any(row and row[0] == msg_id for row in rows)
-    except Exception as e:
-        logger.warning(f"Sheet dedup check failed: {e}")
-        return False
-
-
 # ── Historial y contadores ────────────────────────────────────────────────────
 
-def get_user_data(telefono: str) -> dict:
-    """
-    Retorna:
-      - messages: historial para Claude
-      - tipo: 'comensal' | 'restaurante' | None
-      - interacciones_hoy: int
-    """
+async def get_user_data(telefono: str) -> dict:
     try:
-        rows = sheets_read("AlmuerzoBot_DB!A:G")
+        rows = await sheets_read("AlmuerzoBot_DB!A:G")
         if not rows or len(rows) < 2:
             return {"messages": [], "tipo": None, "interacciones_hoy": 0}
 
@@ -254,9 +227,9 @@ def get_user_data(telefono: str) -> dict:
 
 # ── Claude ────────────────────────────────────────────────────────────────────
 
-def ask_claude(messages: list, mensaje: str) -> str:
+async def ask_claude(messages: list, mensaje: str) -> str:
     full_messages = messages + [{"role": "user", "content": mensaje}]
-    response = claude.messages.create(
+    response = await claude.messages.create(
         model      = "claude-sonnet-4-5",
         max_tokens = 500,
         system     = SYSTEM_PROMPT,
@@ -267,7 +240,7 @@ def ask_claude(messages: list, mensaje: str) -> str:
 
 # ── WhatsApp ──────────────────────────────────────────────────────────────────
 
-def send_whatsapp(to: str, body: str):
+async def send_whatsapp(to: str, body: str):
     url     = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     payload = {
@@ -276,15 +249,14 @@ def send_whatsapp(to: str, body: str):
         "type": "text",
         "text": {"body": body[:4096]},
     }
-    resp = httpx.post(url, headers=headers, json=payload)
+    resp = await http.post(url, headers=headers, json=payload)
     if resp.status_code != 200:
         logger.error(f"WhatsApp error {resp.status_code}: {resp.text}")
 
 
 # ── Background task ───────────────────────────────────────────────────────────
 
-def process_message(msg: dict, value: dict):
-    import time
+async def process_message(msg: dict, value: dict):
     try:
         msg_id    = msg.get("id", "")
         telefono  = msg["from"]
@@ -296,7 +268,7 @@ def process_message(msg: dict, value: dict):
         nombre    = contacts[0]["profile"]["name"] if contacts else "Usuario"
 
         t0 = time.time()
-        user_data         = get_user_data(telefono)
+        user_data         = await get_user_data(telefono)
         logger.info(f"[{telefono}] sheets_read: {time.time()-t0:.2f}s")
         tipo              = user_data["tipo"]
         interacciones_hoy = user_data["interacciones_hoy"]
@@ -305,8 +277,8 @@ def process_message(msg: dict, value: dict):
         limite = LIMIT_RESTAURANTE if tipo == "restaurante" else LIMIT_COMENSAL
         if interacciones_hoy >= limite:
             respuesta = MENSAJE_LIMITE_RESTAURANTE if tipo == "restaurante" else MENSAJE_LIMITE_COMENSAL
-            send_whatsapp(telefono, respuesta)
-            sheets_append([
+            await send_whatsapp(telefono, respuesta)
+            await sheets_append([
                 str(int(ahora.timestamp() * 1000)),
                 telefono, nombre, texto,
                 "[LÍMITE ALCANZADO]", fecha_str, hora_str, msg_id,
@@ -314,20 +286,19 @@ def process_message(msg: dict, value: dict):
             return
 
         t1 = time.time()
-        respuesta = ask_claude(historial, texto)
+        respuesta = await ask_claude(historial, texto)
         logger.info(f"[{telefono}] ask_claude: {time.time()-t1:.2f}s")
 
+        # WhatsApp primero → el usuario recibe la respuesta antes de que guardemos en sheet
         t2 = time.time()
-        sheets_append([
+        await send_whatsapp(telefono, respuesta)
+        logger.info(f"[{telefono}] send_whatsapp: {time.time()-t2:.2f}s | total hasta respuesta: {time.time()-t0:.2f}s")
+
+        await sheets_append([
             str(int(ahora.timestamp() * 1000)),
             telefono, nombre, texto,
             respuesta[:500], fecha_str, hora_str, msg_id,
         ])
-        logger.info(f"[{telefono}] sheets_append: {time.time()-t2:.2f}s")
-
-        t3 = time.time()
-        send_whatsapp(telefono, respuesta)
-        logger.info(f"[{telefono}] send_whatsapp: {time.time()-t3:.2f}s | total: {time.time()-t0:.2f}s")
 
     except Exception as e:
         logger.exception(f"Error procesando mensaje: {e}")
@@ -360,7 +331,6 @@ async def receive(request: Request, background_tasks: BackgroundTasks):
         msg = messages[0]
 
         if msg.get("type") != "text":
-            # Reply so the user knows we only handle text, and Meta gets 200 (no retry)
             telefono = msg["from"]
             background_tasks.add_task(
                 send_whatsapp, telefono,
