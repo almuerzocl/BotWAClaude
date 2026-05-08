@@ -25,7 +25,7 @@ WHATSAPP_VERIFY_TOKEN  = os.environ["WHATSAPP_VERIFY_TOKEN"]
 GOOGLE_SHEETS_ID       = os.environ["GOOGLE_SHEETS_ID"]
 GOOGLE_SERVICE_ACCOUNT = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 
-CONTEXT_WINDOW     = 10   # últimos 10 intercambios (reducido para velocidad)
+CONTEXT_WINDOW     = 10
 LIMIT_COMENSAL     = 5
 LIMIT_RESTAURANTE  = 10
 
@@ -170,6 +170,14 @@ async def sheets_append(values: list):
 
 async def get_user_data(telefono: str) -> dict:
     try:
+        # Fase 1: verificar si el teléfono existe (solo columna B, más rápido)
+        phones = await sheets_read("AlmuerzoBot_DB!B:B")
+        known = {r[0] for r in phones if r}
+        if telefono not in known:
+            logger.info(f"[{telefono}] usuario nuevo — sin historial")
+            return {"messages": [], "tipo": None, "interacciones_hoy": 0}
+
+        # Fase 2: el teléfono existe, leer historial completo
         rows = await sheets_read("AlmuerzoBot_DB!A:G")
         if not rows or len(rows) < 2:
             return {"messages": [], "tipo": None, "interacciones_hoy": 0}
@@ -230,7 +238,7 @@ async def get_user_data(telefono: str) -> dict:
 async def ask_claude(messages: list, mensaje: str) -> str:
     full_messages = messages + [{"role": "user", "content": mensaje}]
     response = await claude.messages.create(
-        model      = "claude-sonnet-4-5",
+        model      = "claude-haiku-4-5-20251001",
         max_tokens = 500,
         system     = SYSTEM_PROMPT,
         messages   = full_messages,
