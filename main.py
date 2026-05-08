@@ -7,7 +7,10 @@ from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import PlainTextResponse
 import anthropic
-import redis as redis_lib
+try:
+    import redis as redis_lib
+except ImportError:
+    redis_lib = None
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -32,10 +35,10 @@ app    = FastAPI(title="AlmuerzoBot")
 # ── Deduplicación de mensajes ─────────────────────────────────────────────────
 # Redis: lock atómico cross-process (Upstash free tier).
 # In-memory: fallback si no hay Redis configurado.
-_redis: redis_lib.Redis | None = None
+_redis = None
 try:
     _redis_url = os.environ.get("REDIS_URL", "")
-    if _redis_url:
+    if _redis_url and redis_lib is not None:
         _redis = redis_lib.from_url(_redis_url, decode_responses=True)
         _redis.ping()
         logger.info("Redis conectado para deduplicación")
