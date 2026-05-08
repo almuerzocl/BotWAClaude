@@ -145,6 +145,7 @@ def _get_access_token() -> str:
     resp   = httpx.post(
         "https://oauth2.googleapis.com/token",
         data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": signed},
+        timeout=10,
     )
     token = resp.json()["access_token"]
     _token_cache["token"] = token
@@ -155,7 +156,8 @@ def _get_access_token() -> str:
 def sheets_read(range_: str) -> list:
     token = _get_access_token()
     url   = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEETS_ID}/values/{range_}"
-    resp  = httpx.get(url, headers={"Authorization": f"Bearer {token}"})
+    resp  = httpx.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+    resp.raise_for_status()
     return resp.json().get("values", [])
 
 
@@ -165,7 +167,9 @@ def sheets_append(values: list):
         f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEETS_ID}"
         f"/values/AlmuerzoBot_DB!A:H:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS"
     )
-    httpx.post(url, headers={"Authorization": f"Bearer {token}"}, json={"values": [values]})
+    resp = httpx.post(url, headers={"Authorization": f"Bearer {token}"}, json={"values": [values]}, timeout=10)
+    if resp.status_code != 200:
+        logger.error(f"Sheets append error {resp.status_code}: {resp.text}")
 
 
 def _wamid_already_in_sheet(msg_id: str) -> bool:
@@ -277,6 +281,7 @@ def send_whatsapp(to: str, body: str):
 # ── Background task ───────────────────────────────────────────────────────────
 
 def process_message(msg: dict, value: dict):
+    import time
     try:
         msg_id    = msg.get("id", "")
         telefono  = msg["from"]
@@ -287,8 +292,9 @@ def process_message(msg: dict, value: dict):
         contacts  = value.get("contacts", [])
         nombre    = contacts[0]["profile"]["name"] if contacts else "Usuario"
 
-
+        t0 = time.time()
         user_data         = get_user_data(telefono)
+        logger.info(f"[{telefono}] sheets_read: {time.time()-t0:.2f}s")
         tipo              = user_data["tipo"]
         interacciones_hoy = user_data["interacciones_hoy"]
         historial         = user_data["messages"]
@@ -304,13 +310,21 @@ def process_message(msg: dict, value: dict):
             ])
             return
 
+        t1 = time.time()
         respuesta = ask_claude(historial, texto)
+        logger.info(f"[{telefono}] ask_claude: {time.time()-t1:.2f}s")
+
+        t2 = time.time()
         sheets_append([
             str(int(ahora.timestamp() * 1000)),
             telefono, nombre, texto,
             respuesta[:500], fecha_str, hora_str, msg_id,
         ])
+        logger.info(f"[{telefono}] sheets_append: {time.time()-t2:.2f}s")
+
+        t3 = time.time()
         send_whatsapp(telefono, respuesta)
+        logger.info(f"[{telefono}] send_whatsapp: {time.time()-t3:.2f}s | total: {time.time()-t0:.2f}s")
 
     except Exception as e:
         logger.exception(f"Error procesando mensaje: {e}")
