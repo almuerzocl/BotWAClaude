@@ -126,9 +126,21 @@ def sheets_append(values: list):
     token = _get_access_token()
     url   = (
         f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEETS_ID}"
-        f"/values/AlmuerzoBot_DB!A:G:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS"
+        f"/values/AlmuerzoBot_DB!A:H:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS"
     )
     httpx.post(url, headers={"Authorization": f"Bearer {token}"}, json={"values": [values]})
+
+
+def _wamid_already_in_sheet(msg_id: str) -> bool:
+    """Cross-process dedup: check column H for this WhatsApp message ID."""
+    if not msg_id:
+        return False
+    try:
+        rows = sheets_read("AlmuerzoBot_DB!H:H")
+        return any(row and row[0] == msg_id for row in rows)
+    except Exception as e:
+        logger.warning(f"Sheet dedup check failed: {e}")
+        return False
 
 
 # ── Historial y contadores ────────────────────────────────────────────────────
@@ -229,6 +241,7 @@ def send_whatsapp(to: str, body: str):
 
 def process_message(msg: dict, value: dict):
     try:
+        msg_id    = msg.get("id", "")
         telefono  = msg["from"]
         texto     = msg["text"]["body"]
         ahora     = datetime.now()
@@ -236,6 +249,11 @@ def process_message(msg: dict, value: dict):
         hora_str  = ahora.strftime("%Y-%m-%d %H:%M:%S")
         contacts  = value.get("contacts", [])
         nombre    = contacts[0]["profile"]["name"] if contacts else "Usuario"
+
+        # Sheet-level dedup: catches cross-process / cross-instance duplicates
+        if _wamid_already_in_sheet(msg_id):
+            logger.info(f"Wamid ya en sheet, ignorado: {msg_id}")
+            return
 
         user_data         = get_user_data(telefono)
         tipo              = user_data["tipo"]
@@ -249,7 +267,7 @@ def process_message(msg: dict, value: dict):
             sheets_append([
                 str(int(ahora.timestamp() * 1000)),
                 telefono, nombre, texto,
-                "[LÍMITE ALCANZADO]", fecha_str, hora_str,
+                "[LÍMITE ALCANZADO]", fecha_str, hora_str, msg_id,
             ])
             return
 
@@ -257,7 +275,7 @@ def process_message(msg: dict, value: dict):
         sheets_append([
             str(int(ahora.timestamp() * 1000)),
             telefono, nombre, texto,
-            respuesta[:500], fecha_str, hora_str,
+            respuesta[:500], fecha_str, hora_str, msg_id,
         ])
         send_whatsapp(telefono, respuesta)
 
