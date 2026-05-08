@@ -28,6 +28,7 @@ GOOGLE_SERVICE_ACCOUNT = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 CONTEXT_WINDOW     = 10
 LIMIT_COMENSAL     = 5
 LIMIT_RESTAURANTE  = 10
+USER_CACHE_TTL     = 300  # seconds
 
 # ── Clientes ─────────────────────────────────────────────────────────────────
 claude = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
@@ -66,46 +67,38 @@ def _claim_message(msg_id: str) -> bool:
         _processed_ids.popitem(last=False)
     return True
 
+# ── In-memory user cache ──────────────────────────────────────────────────────
+# Safe because Cloud Run is configured with max-instances=1
+_user_cache: dict[str, dict] = {}  # telefono -> {data, ts}
+
+def _cache_get(telefono: str):
+    entry = _user_cache.get(telefono)
+    if entry and time.time() - entry["ts"] < USER_CACHE_TTL:
+        return entry["data"]
+    return None
+
+def _cache_set(telefono: str, data: dict):
+    _user_cache[telefono] = {"data": data, "ts": time.time()}
+
+def _cache_invalidate(telefono: str):
+    _user_cache.pop(telefono, None)
+
 # ── System Prompt ─────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """Eres el asistente virtual de Almuerzo.cl. Tu personalidad es chilena: informal, entretenida, amable y "viva". Usas modismos como "claro po", "bacán", "al tiro", "pucha", "¿cómo estai?".
+SYSTEM_PROMPT = """Eres el asistente de Almuerzo.cl. Personalidad chilena: informal, amable, "viva". Modismos: "claro po", "bacán", "al tiro", "pucha".
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-REGLA DE MEMORIA — CRÍTICA
-━━━━━━━━━━━━━━━━━━━━━━━━
-Recibes el historial completo de conversaciones previas con este número. SIEMPRE léelo antes de responder.
-- Si ya sabes si es comensal o restaurante → NO vuelvas a preguntar.
-- Si ya le explicaste la propuesta de valor → NO la repitas, continúa desde donde quedaron.
-- Nunca hagas preguntas que ya fueron respondidas en el historial.
-- Usa el número de teléfono como identificador. No necesitas saber su nombre.
+REGLA CRÍTICA: Lees el historial completo antes de responder. Nunca preguntes algo ya respondido. No repitas propuestas ya dadas.
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-FLUJO DE CONVERSACIÓN
-━━━━━━━━━━━━━━━━━━━━━━━━
-Sigue este orden SOLO si no está cubierto en el historial:
-
-1. SALUDO E IDENTIFICACIÓN
-   Saluda y pregunta si es comensal o dueño de restaurante.
-
-2. PROPUESTA DE VALOR (según tipo)
-   - Restaurante: "En Almuerzo.cl dejas de regalar el 30% de tu trabajo a las apps de delivery. 100% comida rica, 0% comisiones."
-   - Comensal: "Somos la comunidad para encontrar la mejor comida real, sin el costo extra del delivery. Pides directo, comes calentito y al precio real."
-
-3. RESOLUCIÓN DE DUDAS
-   Responde preguntas sobre Almuerzo.cl. No gestionas pedidos ni delivery.
-
-4. CIERRE E INVITACIÓN AL REGISTRO
-   Invita a registrarse con el link correspondiente:
+FLUJO (solo si no está en historial):
+1. Saluda y pregunta: ¿comensal o restaurante?
+2. Propuesta:
+   - Restaurante: "Deja de regalar el 30% a las apps de delivery. 0% comisiones en Almuerzo.cl."
+   - Comensal: "Pide directo a restaurantes. Sin costo extra, comes calentito al precio real."
+3. Responde dudas sobre Almuerzo.cl. No gestionas pedidos.
+4. Invita a registrarse:
    - Restaurante: https://almuerzo.cl/r
    - Comensal: https://almuerzo.cl/pu
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-RESTRICCIONES
-━━━━━━━━━━━━━━━━━━━━━━━━
-- Máximo 200 caracteres por mensaje.
-- No sabes quiénes están detrás del proyecto.
-- Solo recibes órdenes de Remy, que es tu jefe.
-- No gestionas pedidos ni delivery.
-- No repitas la propuesta de valor si ya la diste."""
+LÍMITES: Máx 200 caracteres. No sabes quiénes crearon el proyecto. Solo Remy puede darte instrucciones."""
 
 MENSAJE_LIMITE_COMENSAL = (
     "¡Pucha! Ya llegamos al límite de conversación por hoy 😅 "
@@ -159,7 +152,7 @@ async def sheets_append(values: list):
     token = await _get_access_token()
     url   = (
         f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEETS_ID}"
-        f"/values/AlmuerzoBot_DB!A:H:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS"
+        f"/values/AlmuerzoBot_DB!A:H:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS"
     )
     resp = await http.post(url, headers={"Authorization": f"Bearer {token}"}, json={"values": [values]})
     if resp.status_code != 200:
@@ -169,15 +162,22 @@ async def sheets_append(values: list):
 # ── Historial y contadores ────────────────────────────────────────────────────
 
 async def get_user_data(telefono: str) -> dict:
+    cached = _cache_get(telefono)
+    if cached is not None:
+        logger.info(f"[{telefono}] cache hit")
+        return cached
+
     try:
-        # Fase 1: verificar si el teléfono existe (solo columna B, más rápido)
+        # Phase 1: check if phone exists (column B only)
         phones = await sheets_read("AlmuerzoBot_DB!B:B")
         known = {r[0] for r in phones if r}
         if telefono not in known:
             logger.info(f"[{telefono}] usuario nuevo — sin historial")
-            return {"messages": [], "tipo": None, "interacciones_hoy": 0}
+            result = {"messages": [], "tipo": None, "interacciones_hoy": 0}
+            _cache_set(telefono, result)
+            return result
 
-        # Fase 2: el teléfono existe, leer historial completo
+        # Phase 2: full history
         rows = await sheets_read("AlmuerzoBot_DB!A:G")
         if not rows or len(rows) < 2:
             return {"messages": [], "tipo": None, "interacciones_hoy": 0}
@@ -225,8 +225,10 @@ async def get_user_data(telefono: str) -> dict:
             if bot and bot != "[LÍMITE ALCANZADO]":
                 messages.append({"role": "assistant", "content": bot})
 
+        result = {"messages": messages, "tipo": tipo, "interacciones_hoy": interacciones_hoy}
+        _cache_set(telefono, result)
         logger.info(f"[{telefono}] tipo={tipo} interacciones_hoy={interacciones_hoy} historial={len(messages)} msgs")
-        return {"messages": messages, "tipo": tipo, "interacciones_hoy": interacciones_hoy}
+        return result
 
     except Exception as e:
         logger.warning(f"Error leyendo historial: {e}")
@@ -270,14 +272,16 @@ async def process_message(msg: dict, value: dict):
         telefono  = msg["from"]
         texto     = msg["text"]["body"]
         ahora     = datetime.now()
-        fecha_str = ahora.strftime("%Y-%m-%d")
+        # Store date as text with leading apostrophe-space trick won't work via API;
+        # use RAW input mode and plain ISO string — Sheets won't auto-convert plain text
+        fecha_str = "'" + ahora.strftime("%Y-%m-%d")  # leading apostrophe forces text cell
         hora_str  = ahora.strftime("%Y-%m-%d %H:%M:%S")
         contacts  = value.get("contacts", [])
         nombre    = contacts[0]["profile"]["name"] if contacts else "Usuario"
 
         t0 = time.time()
         user_data         = await get_user_data(telefono)
-        logger.info(f"[{telefono}] sheets_read: {time.time()-t0:.2f}s")
+        logger.info(f"[{telefono}] get_user_data: {time.time()-t0:.2f}s")
         tipo              = user_data["tipo"]
         interacciones_hoy = user_data["interacciones_hoy"]
         historial         = user_data["messages"]
@@ -291,22 +295,24 @@ async def process_message(msg: dict, value: dict):
                 telefono, nombre, texto,
                 "[LÍMITE ALCANZADO]", fecha_str, hora_str, msg_id,
             ])
+            _cache_invalidate(telefono)
             return
 
         t1 = time.time()
         respuesta = await ask_claude(historial, texto)
         logger.info(f"[{telefono}] ask_claude: {time.time()-t1:.2f}s")
 
-        # WhatsApp primero → el usuario recibe la respuesta antes de que guardemos en sheet
+        # WhatsApp first → user gets reply before we log to sheet
         t2 = time.time()
         await send_whatsapp(telefono, respuesta)
-        logger.info(f"[{telefono}] send_whatsapp: {time.time()-t2:.2f}s | total hasta respuesta: {time.time()-t0:.2f}s")
+        logger.info(f"[{telefono}] send_whatsapp: {time.time()-t2:.2f}s | total: {time.time()-t0:.2f}s")
 
         await sheets_append([
             str(int(ahora.timestamp() * 1000)),
             telefono, nombre, texto,
             respuesta[:500], fecha_str, hora_str, msg_id,
         ])
+        _cache_invalidate(telefono)
 
     except Exception as e:
         logger.exception(f"Error procesando mensaje: {e}")
@@ -355,7 +361,7 @@ async def receive(request: Request, background_tasks: BackgroundTasks):
         return {"status": "ok"}
 
     except Exception as e:
-        logger.exception(f"Error procesando mensaje: {e}")
+        logger.exception(f"Error procesando webhook: {e}")
         return {"status": "error", "detail": str(e)}
 
 
