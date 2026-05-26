@@ -8,34 +8,41 @@ from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import PlainTextResponse
 import anthropic
+
 try:
     import redis as redis_lib
 except ImportError:
     redis_lib = None
 
-# ── Logging ──────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("almuerzobot")
 
-# ── Config ───────────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY      = os.environ["ANTHROPIC_API_KEY"]
-WHATSAPP_TOKEN         = os.environ["WHATSAPP_TOKEN"]
-WHATSAPP_PHONE_ID      = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
-WHATSAPP_VERIFY_TOKEN  = os.environ["WHATSAPP_VERIFY_TOKEN"]
-GOOGLE_SHEETS_ID       = os.environ["GOOGLE_SHEETS_ID"]
-GOOGLE_SERVICE_ACCOUNT = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+# ── Config ────────────────────────────────────────────────────────────────────
+ANTHROPIC_API_KEY        = os.environ["ANTHROPIC_API_KEY"]
+WHATSAPP_TOKEN           = os.environ["WHATSAPP_TOKEN"]
+WHATSAPP_PHONE_ID        = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
+WHATSAPP_VERIFY_TOKEN    = os.environ["WHATSAPP_VERIFY_TOKEN"]
+GOOGLE_SHEETS_ID         = os.environ["GOOGLE_SHEETS_ID"]
+GOOGLE_SERVICE_ACCOUNT   = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 
-CONTEXT_WINDOW     = 10
-LIMIT_COMENSAL     = 5
-LIMIT_RESTAURANTE  = 10
-USER_CACHE_TTL     = 300  # seconds
+CONTEXT_WINDOW  = 10
+LIMIT_COMENSAL  = 5
+LIMIT_RESTAURANTE = 10
+USER_CACHE_TTL  = 600   # segundos — aumentado de 300 a 600
 
-# ── Clientes ─────────────────────────────────────────────────────────────────
+# ── Clientes ──────────────────────────────────────────────────────────────────
 claude = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-http   = httpx.AsyncClient(timeout=10)
-app    = FastAPI(title="AlmuerzoBot")
 
-# ── Deduplicación ─────────────────────────────────────────────────────────────
+# Connection pooling explícito para reducir overhead por request
+http = httpx.AsyncClient(
+    timeout=10,
+    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+)
+
+app = FastAPI(title="AlmuerzoBot")
+
+# ── Deduplicación ──────────────────────────────────────────────────────────────
 _redis = None
 try:
     _redis_url = os.environ.get("REDIS_URL", "")
@@ -67,8 +74,8 @@ def _claim_message(msg_id: str) -> bool:
         _processed_ids.popitem(last=False)
     return True
 
-# ── In-memory user cache ──────────────────────────────────────────────────────
-# Safe because Cloud Run is configured with max-instances=1
+# ── In-memory user cache ───────────────────────────────────────────────────────
+# Seguro porque Render free plan corre con una sola instancia
 _user_cache: dict[str, dict] = {}  # telefono -> {data, ts}
 
 def _cache_get(telefono: str):
@@ -80,34 +87,60 @@ def _cache_get(telefono: str):
 def _cache_set(telefono: str, data: dict):
     _user_cache[telefono] = {"data": data, "ts": time.time()}
 
+def _cache_update(telefono: str, user_msg: str, bot_msg: str):
+    """
+    Actualiza el cache localmente sin ir a Sheets.
+    Evita un round-trip completo en el siguiente mensaje del mismo usuario.
+    """
+    entry = _user_cache.get(telefono)
+    if not entry:
+        return
+    data = entry["data"]
+    msgs = data["messages"]
+    msgs.append({"role": "user",      "content": user_msg})
+    msgs.append({"role": "assistant", "content": bot_msg})
+    # Mantener solo la ventana de contexto
+    if len(msgs) > CONTEXT_WINDOW * 2:
+        msgs = msgs[-(CONTEXT_WINDOW * 2):]
+    data["messages"] = msgs
+    data["interacciones_hoy"] = data.get("interacciones_hoy", 0) + 1
+    _user_cache[telefono] = {"data": data, "ts": entry["ts"]}  # preservar ts original
+
 def _cache_invalidate(telefono: str):
     _user_cache.pop(telefono, None)
 
-# ── System Prompt ─────────────────────────────────────────────────────────────
+# ── System Prompt ──────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """Eres el asistente de Almuerzo.cl. Tono: chileno (no argentino), informal, amable. Usas "claro po", "bacán", "al tiro", "pucha" cuando es natural.
 
 MEMORIA: Lees el historial antes de responder. Nunca repites preguntas ya respondidas ni propuestas ya dadas.
 
 FLUJO (solo si no está en historial):
+
 1. Saluda y pregunta si es comensal o dueño de restaurante.
+
 2. Propuesta según tipo:
    - Restaurante: "Deja de regalar el 30% a las apps. En Almuerzo.cl pagas 0% comisiones."
    - Comensal: "Pide directo al restaurante. Sin cobros extra, comes calentito al precio real, no con el 30% más que te pone el delivery."
+
 3. Responde dudas sobre Almuerzo.cl. NO gestionas pedidos ni delivery.
-   PRICING (solo para restaurantes):
-   - Cobro: planes desde $58.500 pesos fijos al mes. Sin comisiones variables, sin sorpresas. Al mencionarlo, pregunta: "¿Cuánto pagás en comisiones a las apps de delivery? Te apuesto que son varias veces eso."
-   - Cancelación: cancelas la suscripción, pagas solo el mes en curso (y lo puedes seguir usando) y al mes siguiente ya no se cobra nada más.
-   TODO EL RESTO DE INFORMACION O DUDAS QUE TE PRERRGUNTEN: voy a buscar la información en nuestro sitio web https://almuerzo.cl
+
+PRICING (solo para restaurantes):
+- Cobro: planes desde $58.500 pesos fijos al mes. Sin comisiones variables, sin sorpresas. Al mencionarlo, pregunta: "¿Cuánto pagás en comisiones a las apps de delivery? Te apuesto que son varias veces eso."
+- Cancelación: cancelas la suscripción, pagas solo el mes en curso (y lo puedes seguir usando) y al mes siguiente ya no se cobra nada más.
+
+TODO EL RESTO DE INFORMACION O DUDAS QUE TE PRERRGUNTEN: voy a buscar la información en nuestro sitio web https://almuerzo.cl
+
 4. Cuéntales de las funcionalidades que tiene el sistema:
-   - Restaurante: 
-        - Tenemos una app especializada para manejar relaciones con tus clientes. Obtienes:
-        - una app de reservas para tu establecimiento
-        - una plataforma de pedidos directa a tu local, para que los clientes pasen a buscar su orden
-        - y una app que informa a tus clientes suscritos cuando publicas el menú del día
-   - Comensal: 
-        - Tenemos un sistema de reservas que hace super fácil coordinar un almuerzo entre amigos y todos quedan conectados y todos saben quién va y quien no. Es bacán.
-        - Hay también una plataforma igualita a la de las aplicaciones de delivery, pero que te coordina directamente con el restaurante para ir a buscar tu pedido a la hora que tú le dices. 
-        - Y si tienes un plato favorito en algún restaurante y te suscribes a recibir su menú vas a saber al tiro, cuando está para que lo reserves
+   - Restaurante:
+     - Tenemos una app especializada para manejar relaciones con tus clientes. Obtienes:
+       - una app de reservas para tu establecimiento
+       - una plataforma de pedidos directa a tu local, para que los clientes pasen a buscar su orden
+       - y una app que informa a tus clientes suscritos cuando publicas el menú del día
+   - Comensal:
+     - Tenemos un sistema de reservas que hace super fácil coordinar un almuerzo entre amigos y todos quedan conectados y todos saben quién va y quien no. Es bacán.
+     - Hay también una plataforma igualita a la de las aplicaciones de delivery, pero que te coordina directamente con el restaurante para ir a buscar tu pedido a la hora que tú le dices.
+     - Y si tienes un plato favorito en algún restaurante y te suscribes a recibir su menú vas a saber al tiro, cuando está para que lo reserves
+
 5. Invita a registrarse:
    - Restaurante: https://almuerzo.cl/r
    - Comensal: https://almuerzo.cl/pu
@@ -124,15 +157,13 @@ MENSAJE_LIMITE_COMENSAL = (
     "Mañana seguimos al tiro. "
     "Mientras tanto, regístrate acá: https://almuerzo.cl/pu"
 )
-
 MENSAJE_LIMITE_RESTAURANTE = (
     "¡Pucha! Ya llegamos al límite de conversación por hoy 😅 "
     "Mañana seguimos al tiro. "
     "Mientras tanto, regístrate acá y vende sin comisiones: https://almuerzo.cl/r"
 )
 
-# ── Google Sheets ─────────────────────────────────────────────────────────────
-
+# ── Google Sheets ──────────────────────────────────────────────────────────────
 _token_cache: dict = {"token": None, "exp": 0}
 
 async def _get_access_token() -> str:
@@ -158,7 +189,6 @@ async def _get_access_token() -> str:
     _token_cache["exp"]   = now + 3600
     return token
 
-
 async def sheets_read(range_: str) -> list:
     token = await _get_access_token()
     url   = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEETS_ID}/values/{range_}"
@@ -166,10 +196,9 @@ async def sheets_read(range_: str) -> list:
     resp.raise_for_status()
     return resp.json().get("values", [])
 
-
 async def sheets_append(values: list):
     token = await _get_access_token()
-    url   = (
+    url = (
         f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEETS_ID}"
         f"/values/AlmuerzoBot_DB!A:H:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS"
     )
@@ -177,9 +206,7 @@ async def sheets_append(values: list):
     if resp.status_code != 200:
         logger.error(f"Sheets append error {resp.status_code}: {resp.text}")
 
-
-# ── Historial y contadores ────────────────────────────────────────────────────
-
+# ── Historial y contadores ─────────────────────────────────────────────────────
 async def get_user_data(telefono: str) -> dict:
     cached = _cache_get(telefono)
     if cached is not None:
@@ -187,16 +214,16 @@ async def get_user_data(telefono: str) -> dict:
         return cached
 
     try:
-        # Phase 1: check if phone exists (column B only)
+        # Fase 1: verificar si el teléfono existe (solo columna B)
         phones = await sheets_read("AlmuerzoBot_DB!B:B")
-        known = {r[0] for r in phones if r}
+        known  = {r[0] for r in phones if r}
         if telefono not in known:
             logger.info(f"[{telefono}] usuario nuevo — sin historial")
             result = {"messages": [], "tipo": None, "interacciones_hoy": 0}
             _cache_set(telefono, result)
             return result
 
-        # Phase 2: full history
+        # Fase 2: historial completo
         rows = await sheets_read("AlmuerzoBot_DB!A:G")
         if not rows or len(rows) < 2:
             return {"messages": [], "tipo": None, "interacciones_hoy": 0}
@@ -205,9 +232,9 @@ async def get_user_data(telefono: str) -> dict:
         data   = rows[1:]
         col    = {name: idx for idx, name in enumerate(header)}
 
-        tel_idx   = col.get("telefono")
-        msg_idx   = col.get("mensaje_recibido")
-        bot_idx   = col.get("respuesta_bot")
+        tel_idx  = col.get("telefono")
+        msg_idx  = col.get("mensaje_recibido")
+        bot_idx  = col.get("respuesta_bot")
         fecha_idx = col.get("fecha_contacto")
 
         if tel_idx is None or msg_idx is None or bot_idx is None:
@@ -223,8 +250,8 @@ async def get_user_data(telefono: str) -> dict:
                 and (len(r) <= bot_idx or r[bot_idx] != "[LÍMITE ALCANZADO]"))
         )
 
-        tipo = None
-        all_text = " ".join(
+        tipo      = None
+        all_text  = " ".join(
             (r[msg_idx] if len(r) > msg_idx else "") + " " +
             (r[bot_idx] if len(r) > bot_idx else "")
             for r in user_rows
@@ -253,22 +280,18 @@ async def get_user_data(telefono: str) -> dict:
         logger.warning(f"Error leyendo historial: {e}")
         return {"messages": [], "tipo": None, "interacciones_hoy": 0}
 
-
-# ── Claude ────────────────────────────────────────────────────────────────────
-
+# ── Claude ─────────────────────────────────────────────────────────────────────
 async def ask_claude(messages: list, mensaje: str) -> str:
     full_messages = messages + [{"role": "user", "content": mensaje}]
     response = await claude.messages.create(
         model      = "claude-haiku-4-5-20251001",
-        max_tokens = 500,
+        max_tokens = 150,   # restricción del prompt es 200 chars ≈ 50-60 tokens; 150 da margen sin overhead
         system     = SYSTEM_PROMPT,
         messages   = full_messages,
     )
     return response.content[0].text
 
-
-# ── WhatsApp ──────────────────────────────────────────────────────────────────
-
+# ── WhatsApp ───────────────────────────────────────────────────────────────────
 async def send_whatsapp(to: str, body: str):
     url     = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
@@ -282,30 +305,29 @@ async def send_whatsapp(to: str, body: str):
     if resp.status_code != 200:
         logger.error(f"WhatsApp error {resp.status_code}: {resp.text}")
 
-
-# ── Background task ───────────────────────────────────────────────────────────
-
+# ── Background task ────────────────────────────────────────────────────────────
 async def process_message(msg: dict, value: dict):
     try:
-        msg_id    = msg.get("id", "")
-        telefono  = msg["from"]
-        texto     = msg["text"]["body"]
-        ahora     = datetime.now()
-        # Store date as text with leading apostrophe-space trick won't work via API;
-        # use RAW input mode and plain ISO string — Sheets won't auto-convert plain text
-        fecha_str = "'" + ahora.strftime("%Y-%m-%d")  # leading apostrophe forces text cell
-        hora_str  = ahora.strftime("%Y-%m-%d %H:%M:%S")
-        contacts  = value.get("contacts", [])
-        nombre    = contacts[0]["profile"]["name"] if contacts else "Usuario"
+        msg_id   = msg.get("id", "")
+        telefono = msg["from"]
+        texto    = msg["text"]["body"]
+        ahora    = datetime.now()
 
-        t0 = time.time()
-        user_data         = await get_user_data(telefono)
+        fecha_str = "'" + ahora.strftime("%Y-%m-%d")
+        hora_str  = ahora.strftime("%Y-%m-%d %H:%M:%S")
+
+        contacts = value.get("contacts", [])
+        nombre   = contacts[0]["profile"]["name"] if contacts else "Usuario"
+
+        t0        = time.time()
+        user_data = await get_user_data(telefono)
         logger.info(f"[{telefono}] get_user_data: {time.time()-t0:.2f}s")
+
         tipo              = user_data["tipo"]
         interacciones_hoy = user_data["interacciones_hoy"]
         historial         = user_data["messages"]
+        limite            = LIMIT_RESTAURANTE if tipo == "restaurante" else LIMIT_COMENSAL
 
-        limite = LIMIT_RESTAURANTE if tipo == "restaurante" else LIMIT_COMENSAL
         if interacciones_hoy >= limite:
             respuesta = MENSAJE_LIMITE_RESTAURANTE if tipo == "restaurante" else MENSAJE_LIMITE_COMENSAL
             await send_whatsapp(telefono, respuesta)
@@ -317,28 +339,29 @@ async def process_message(msg: dict, value: dict):
             _cache_invalidate(telefono)
             return
 
-        t1 = time.time()
+        t1       = time.time()
         respuesta = await ask_claude(historial, texto)
         logger.info(f"[{telefono}] ask_claude: {time.time()-t1:.2f}s")
 
-        # WhatsApp first → user gets reply before we log to sheet
+        # WhatsApp primero → el usuario recibe la respuesta antes de que loguemos
         t2 = time.time()
         await send_whatsapp(telefono, respuesta)
         logger.info(f"[{telefono}] send_whatsapp: {time.time()-t2:.2f}s | total: {time.time()-t0:.2f}s")
 
+        # Actualizar cache localmente — el próximo mensaje no va a Sheets
+        _cache_update(telefono, texto, respuesta)
+
+        # Persistir en Sheets (fuera del camino crítico)
         await sheets_append([
             str(int(ahora.timestamp() * 1000)),
             telefono, nombre, texto,
             respuesta[:500], fecha_str, hora_str, msg_id,
         ])
-        _cache_invalidate(telefono)
 
     except Exception as e:
         logger.exception(f"Error procesando mensaje: {e}")
 
-
-# ── Webhook endpoints ─────────────────────────────────────────────────────────
-
+# ── Webhook endpoints ──────────────────────────────────────────────────────────
 @app.get("/webhook")
 async def verify(request: Request):
     params = request.query_params
@@ -346,16 +369,15 @@ async def verify(request: Request):
         return PlainTextResponse(params.get("hub.challenge", ""))
     raise HTTPException(status_code=403, detail="Token inválido")
 
-
 @app.post("/webhook")
 async def receive(request: Request, background_tasks: BackgroundTasks):
     body = await request.json()
     logger.info(f"Payload: {json.dumps(body)[:300]}")
 
     try:
-        entry    = body["entry"][0]
-        changes  = entry["changes"][0]
-        value    = changes["value"]
+        entry   = body["entry"][0]
+        changes = entry["changes"][0]
+        value   = changes["value"]
         messages = value.get("messages", [])
 
         if not messages:
@@ -383,7 +405,15 @@ async def receive(request: Request, background_tasks: BackgroundTasks):
         logger.exception(f"Error procesando webhook: {e}")
         return {"status": "error", "detail": str(e)}
 
-
 @app.get("/")
 async def health():
     return {"status": "AlmuerzoBot corriendo 🍽️"}
+
+# ── Precalentar token Google al arrancar ───────────────────────────────────────
+@app.on_event("startup")
+async def startup_warmup():
+    try:
+        await _get_access_token()
+        logger.info("Token Google precalentado al inicio")
+    except Exception as e:
+        logger.warning(f"Warmup token falló (no crítico): {e}")
