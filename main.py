@@ -109,7 +109,7 @@ def _cache_invalidate(telefono: str):
     _user_cache.pop(telefono, None)
 
 # ── Detección de modo Saborez ──────────────────────────────────────────────────
-SABOREZ_TRIGGER = "Hola, quiero saber más sobre Saborez 👋"
+SABOREZ_TRIGGER = "Hola, quiero saber más sobre Saborez"
 
 def _is_saborez_mode(user_data: dict) -> bool:
     """
