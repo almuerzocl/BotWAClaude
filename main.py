@@ -3,11 +3,15 @@ import json
 import time
 import httpx
 import logging
+import re
+import hmac
+import hashlib
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, FileResponse, JSONResponse
 import anthropic
 
 try:
@@ -26,6 +30,21 @@ WHATSAPP_PHONE_ID      = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
 WHATSAPP_VERIFY_TOKEN  = os.environ["WHATSAPP_VERIFY_TOKEN"]
 GOOGLE_SHEETS_ID       = os.environ["GOOGLE_SHEETS_ID"]
 GOOGLE_SERVICE_ACCOUNT = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+
+# Bandeja manual (opcional): si INBOX_PASSWORD no está definida, la interfaz queda deshabilitada.
+INBOX_PASSWORD = os.environ.get("INBOX_PASSWORD", "")
+SESSION_SECRET = os.environ.get("SESSION_SECRET", "") or INBOX_PASSWORD
+SESSION_TTL    = 60 * 60 * 24 * 7
+CONTROL_TAB    = "AlmuerzoBot_Control"
+DB_TAB         = "AlmuerzoBot_DB"
+
+MARCA_LIMITE = "[LÍMITE ALCANZADO]"
+MARCA_MANUAL = "[MANUAL]"
+MARCA_FALLO  = "[ENTREGA FALLIDA]"
+MARCAS       = {MARCA_LIMITE, MARCA_MANUAL}
+
+def _es_marca(texto: str) -> bool:
+    return texto in MARCAS or texto.startswith(MARCA_FALLO)
 
 CONTEXT_WINDOW    = 10
 LIMIT_COMENSAL    = 5
@@ -203,6 +222,88 @@ async def sheets_append(sheet_name: str, values: list):
     if resp.status_code != 200:
         logger.error(f"Sheets append error {resp.status_code}: {resp.text}")
 
+async def sheets_append_many(sheet_name: str, rows: list):
+    if not rows:
+        return
+    token = await _get_access_token()
+    url = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEETS_ID}"
+        f"/values/{sheet_name}!A:H:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS"
+    )
+    resp = await http.post(url, headers={"Authorization": f"Bearer {token}"}, json={"values": rows})
+    resp.raise_for_status()
+
+async def sheets_ensure_tab(sheet_name: str, header: list):
+    token   = await _get_access_token()
+    headers = {"Authorization": f"Bearer {token}"}
+    base    = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEETS_ID}"
+    resp = await http.get(f"{base}?fields=sheets.properties.title", headers=headers)
+    resp.raise_for_status()
+    titles = {s["properties"]["title"] for s in resp.json().get("sheets", [])}
+    if sheet_name in titles:
+        return
+    resp = await http.post(
+        f"{base}:batchUpdate", headers=headers,
+        json={"requests": [{"addSheet": {"properties": {"title": sheet_name}}}]},
+    )
+    resp.raise_for_status()
+    await sheets_append_many(sheet_name, [header])
+
+# ── Control manual / automático ────────────────────────────────────────────────
+# Estado persistido como log append-only en la hoja AlmuerzoBot_Control
+# (telefono | modo | fecha). "*" = global. Gana la última fila de cada teléfono.
+# modo: "manual" (humano responde) | "bot" (fuerza bot) | "auto" (sin override).
+_control = {"loaded": False, "global": False, "phones": {}}
+
+async def _load_control():
+    if _control["loaded"]:
+        return
+    try:
+        await sheets_ensure_tab(CONTROL_TAB, ["telefono", "modo", "fecha"])
+        rows = await sheets_read(f"{CONTROL_TAB}!A:C")
+        phones: dict = {}
+        glob = False
+        for r in rows[1:]:
+            if len(r) < 2:
+                continue
+            tel, modo = r[0], r[1]
+            if tel == "*":
+                glob = (modo == "manual")
+            elif modo == "auto":
+                phones.pop(tel, None)
+            else:
+                phones[tel] = modo
+        _control.update(loaded=True, phones=phones, **{"global": glob})
+        logger.info(f"Control cargado: global_manual={glob} overrides={len(phones)}")
+    except Exception as e:
+        logger.warning(f"No se pudo cargar control manual: {e}")
+
+async def is_manual(telefono: str) -> bool:
+    await _load_control()
+    modo = _control["phones"].get(telefono)
+    if modo:
+        return modo == "manual"
+    return _control["global"]
+
+async def set_mode(telefono: str | None, modo: str):
+    """telefono=None → global (modo 'manual' o 'bot'; resetea overrides)."""
+    await _load_control()
+    if not _control["loaded"]:
+        raise RuntimeError("Hoja de control no disponible")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if telefono is None:
+        rows = [[tel, "auto", now] for tel in _control["phones"]]
+        rows.append(["*", modo, now])
+        await sheets_append_many(CONTROL_TAB, rows)
+        _control["phones"] = {}
+        _control["global"] = (modo == "manual")
+    else:
+        await sheets_append_many(CONTROL_TAB, [[telefono, modo, now]])
+        if modo == "auto":
+            _control["phones"].pop(telefono, None)
+        else:
+            _control["phones"][telefono] = modo
+
 # ── Clasificación de usuario ───────────────────────────────────────────────────
 def _detectar_tipo_usuario(texto: str) -> str | None:
     t = texto.lower()
@@ -254,7 +355,8 @@ async def get_user_data(telefono: str) -> dict:
             1 for r in user_rows
             if (fecha_idx is not None and len(r) > fecha_idx
                 and r[fecha_idx].lstrip("'") == hoy
-                and (len(r) <= bot_idx or r[bot_idx] != "[LÍMITE ALCANZADO]"))
+                and len(r) > msg_idx and r[msg_idx]
+                and (len(r) <= bot_idx or not _es_marca(r[bot_idx])))
         )
 
         user_only_text = " ".join(
@@ -268,8 +370,10 @@ async def get_user_data(telefono: str) -> dict:
             bot = r[bot_idx] if len(r) > bot_idx else ""
             if msg:
                 messages.append({"role": "user",      "content": msg})
-            if bot and bot != "[LÍMITE ALCANZADO]":
+            if bot and not _es_marca(bot):
                 messages.append({"role": "assistant", "content": bot})
+        while messages and messages[0]["role"] != "user":
+            messages.pop(0)
 
         result = {"messages": messages, "tipo": tipo, "interacciones_hoy": interacciones_hoy}
         _cache_set(telefono, result)
@@ -289,12 +393,11 @@ async def ask_claude(messages: list, mensaje: str) -> str:
         system     = SYSTEM_PROMPT_ALMUERZO,
         messages   = full_messages,
     )
-    # Limpieza preventiva por si el modelo genera doble asterisco (Markdown estándar)
-    texto_limpio = response.content[0].text.replace("**", "*")
-    return texto_limpio
+    # Limpieza preventiva: WhatsApp usa un solo asterisco (*negrita*), no dos (**)
+    return response.content[0].text.replace("**", "*")
 
 # ── WhatsApp ───────────────────────────────────────────────────────────────────
-async def send_whatsapp(to: str, body: str):
+async def send_whatsapp(to: str, body: str) -> tuple[bool, str]:
     url     = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     payload = {
@@ -306,6 +409,37 @@ async def send_whatsapp(to: str, body: str):
     resp = await http.post(url, headers=headers, json=payload)
     if resp.status_code != 200:
         logger.error(f"WhatsApp error {resp.status_code}: {resp.text}")
+        try:
+            detail = resp.json()["error"]["message"]
+        except Exception:
+            detail = resp.text[:200]
+        return False, detail
+    return True, ""
+
+async def reply_non_text(telefono: str):
+    if await is_manual(telefono):
+        return
+    await send_whatsapp(telefono, "Solo puedo responder mensajes de texto por ahora 🙏")
+
+async def record_delivery_failure(st: dict):
+    """WhatsApp acepta el envío (200) y luego informa fallas de entrega por webhook (statuses)."""
+    try:
+        err    = (st.get("errors") or [{}])[0]
+        detail = err.get("error_data", {}).get("details") or err.get("message") or err.get("title") or "sin detalle"
+        code   = err.get("code", "?")
+        tel    = st.get("recipient_id", "")
+        logger.error(f"[{tel}] Entrega fallida ({code}): {detail}")
+        if not tel:
+            return
+        ahora = datetime.now()
+        await sheets_append(DB_TAB, [
+            str(int(ahora.timestamp() * 1000)), tel, "", "",
+            f"{MARCA_FALLO} ({code}) {detail}",
+            "'" + ahora.strftime("%Y-%m-%d"), ahora.strftime("%Y-%m-%d %H:%M:%S"), st.get("id", ""),
+        ])
+        _db_cache["ts"] = 0
+    except Exception:
+        logger.exception("Error registrando falla de entrega")
 
 # ── Background task ────────────────────────────────────────────────────────────
 async def process_message(msg: dict, value: dict):
@@ -333,6 +467,19 @@ async def process_message(msg: dict, value: dict):
         limite     = LIMIT_RESTAURANTE if tipo == "restaurante" else LIMIT_COMENSAL
         sheet_name = "AlmuerzoBot_DB"
 
+        # ── Modo manual: guardar el mensaje y esperar respuesta humana ───────
+        if await is_manual(telefono):
+            row = [
+                str(int(ahora.timestamp() * 1000)),
+                telefono, nombre, texto,
+                MARCA_MANUAL, fecha_str, hora_str, msg_id,
+            ]
+            await sheets_append(sheet_name, row)
+            _cache_invalidate(telefono)
+            _db_cache["ts"] = 0
+            logger.info(f"[{telefono}] modo manual — mensaje guardado sin respuesta automática")
+            return
+
         # ── Límite alcanzado ────────────────────────────────────────────────
         if interacciones_hoy >= limite:
             respuesta = MENSAJE_LIMITE_RESTAURANTE if tipo == "restaurante" else MENSAJE_LIMITE_COMENSAL
@@ -341,7 +488,7 @@ async def process_message(msg: dict, value: dict):
             row = [
                 str(int(ahora.timestamp() * 1000)),
                 telefono, nombre, texto,
-                "[LÍMITE ALCANZADO]", fecha_str, hora_str, msg_id,
+                MARCA_LIMITE, fecha_str, hora_str, msg_id,
             ]
             await sheets_append(sheet_name, row)
             _cache_invalidate(telefono)
@@ -377,6 +524,9 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Warmup token falló (no crítico): {e}")
 
+    if INBOX_PASSWORD:
+        await _load_control()
+
     if _redis is not None:
         try:
             await _redis.ping()
@@ -411,16 +561,17 @@ async def receive(request: Request, background_tasks: BackgroundTasks):
         value    = changes["value"]
         messages = value.get("messages", [])
 
+        for st in value.get("statuses", []):
+            if st.get("status") == "failed":
+                background_tasks.add_task(record_delivery_failure, st)
+
         if not messages:
             return {"status": "no_messages"}
 
         for msg in messages:
             if msg.get("type") != "text":
                 telefono = msg["from"]
-                background_tasks.add_task(
-                    send_whatsapp, telefono,
-                    "Solo puedo responder mensajes de texto por ahora 🙏"
-                )
+                background_tasks.add_task(reply_non_text, telefono)
                 continue
 
             msg_id = msg.get("id", "")
@@ -439,3 +590,178 @@ async def receive(request: Request, background_tasks: BackgroundTasks):
 @app.get("/")
 async def health():
     return {"status": "AlmuerzoBot corriendo 🍽️"}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Bandeja manual (/inbox)
+# ══════════════════════════════════════════════════════════════════════════════
+INBOX_HTML  = Path(__file__).parent / "inbox.html"
+COOKIE_NAME = "inbox_session"
+_PHONE_RE   = re.compile(r"^\d{6,20}$")
+
+_db_cache = {"rows": [], "ts": 0.0}
+_login_attempts: dict[str, list] = {}
+
+def _sign(exp: int) -> str:
+    return hmac.new(SESSION_SECRET.encode(), str(exp).encode(), hashlib.sha256).hexdigest()
+
+def _make_token() -> str:
+    exp = int(time.time()) + SESSION_TTL
+    return f"{exp}.{_sign(exp)}"
+
+def _valid_token(token: str | None) -> bool:
+    if not token or "." not in token or not SESSION_SECRET:
+        return False
+    exp_s, sig = token.split(".", 1)
+    if not exp_s.isdigit() or int(exp_s) < time.time():
+        return False
+    return hmac.compare_digest(sig, _sign(int(exp_s)))
+
+def _require_auth(request: Request):
+    if not INBOX_PASSWORD:
+        raise HTTPException(status_code=503, detail="Bandeja deshabilitada: falta INBOX_PASSWORD")
+    if not _valid_token(request.cookies.get(COOKIE_NAME)):
+        raise HTTPException(status_code=401, detail="No autenticado")
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")
+    return fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "?")
+
+async def _db_rows() -> list:
+    if time.time() - _db_cache["ts"] < 4:
+        return _db_cache["rows"]
+    rows = await sheets_read(f"{DB_TAB}!A:H")
+    _db_cache.update(rows=rows[1:] if rows else [], ts=time.time())
+    return _db_cache["rows"]
+
+def _build_conversations(rows: list) -> dict:
+    """tel → {nombre, eventos[]}, en orden de aparición."""
+    convs: dict = {}
+    for r in rows:
+        g = lambda i: r[i] if len(r) > i else ""
+        tel = g(1)
+        if not tel:
+            continue
+        c = convs.pop(tel, None) or {"telefono": tel, "nombre": "", "eventos": []}
+        convs[tel] = c  # re-insertar → queda al final (más reciente)
+        if g(2):
+            c["nombre"] = g(2)
+        hora = g(6)
+        if g(3):
+            c["eventos"].append({"dir": "in", "origen": "cliente", "texto": g(3), "hora": hora})
+        bot = g(4)
+        if bot == MARCA_LIMITE:
+            c["eventos"].append({"dir": "out", "origen": "sistema",
+                                 "texto": "Límite diario alcanzado (mensaje automático enviado)", "hora": hora})
+        elif bot.startswith(MARCA_FALLO):
+            c["eventos"].append({"dir": "out", "origen": "sistema",
+                                 "texto": "⚠️ No se entregó un mensaje: " + bot[len(MARCA_FALLO):].strip(), "hora": hora})
+        elif bot and bot != MARCA_MANUAL:
+            c["eventos"].append({"dir": "out", "origen": "manual" if g(7) == "manual" else "bot",
+                                 "texto": bot, "hora": hora})
+    return convs
+
+@app.get("/inbox")
+async def inbox_page():
+    if not INBOX_HTML.exists():
+        raise HTTPException(status_code=404)
+    return FileResponse(INBOX_HTML, media_type="text/html", headers={"Cache-Control": "no-store"})
+
+@app.post("/api/inbox/login")
+async def inbox_login(request: Request):
+    if not INBOX_PASSWORD:
+        raise HTTPException(status_code=503, detail="Bandeja deshabilitada: falta INBOX_PASSWORD")
+    ip  = _client_ip(request)
+    now = time.time()
+    attempts = [t for t in _login_attempts.get(ip, []) if now - t < 900]
+    if len(attempts) >= 10:
+        raise HTTPException(status_code=429, detail="Demasiados intentos, espera unos minutos")
+    body = await request.json()
+    if not hmac.compare_digest(str(body.get("password", "")).encode(), INBOX_PASSWORD.encode()):
+        attempts.append(now)
+        _login_attempts[ip] = attempts
+        raise HTTPException(status_code=401, detail="Contraseña incorrecta")
+    _login_attempts.pop(ip, None)
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(COOKIE_NAME, _make_token(), max_age=SESSION_TTL,
+                    httponly=True, secure=True, samesite="strict")
+    return resp
+
+@app.post("/api/inbox/logout")
+async def inbox_logout():
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(COOKIE_NAME)
+    return resp
+
+@app.get("/api/inbox/conversations")
+async def inbox_conversations(request: Request):
+    _require_auth(request)
+    await _load_control()
+    convs = _build_conversations(await _db_rows())
+    out = []
+    for tel, c in reversed(list(convs.items())):
+        ev     = c["eventos"][-1] if c["eventos"] else {"dir": "in", "texto": "", "hora": ""}
+        manual = await is_manual(tel)
+        out.append({
+            "telefono":      tel,
+            "nombre":        c["nombre"],
+            "ultimo":        ev["texto"][:90],
+            "hora":          ev["hora"],
+            "manual":        manual,
+            "sin_responder": manual and ev["dir"] == "in",
+        })
+    return {"global_manual": _control["global"], "control_ok": _control["loaded"], "conversaciones": out}
+
+@app.get("/api/inbox/conversations/{telefono}")
+async def inbox_conversation(telefono: str, request: Request):
+    _require_auth(request)
+    if not _PHONE_RE.match(telefono):
+        raise HTTPException(status_code=400, detail="Teléfono inválido")
+    c = _build_conversations(await _db_rows()).get(telefono)
+    if not c:
+        raise HTTPException(status_code=404, detail="Conversación no encontrada")
+    return {**c, "manual": await is_manual(telefono)}
+
+@app.post("/api/inbox/send")
+async def inbox_send(request: Request):
+    _require_auth(request)
+    body     = await request.json()
+    telefono = str(body.get("telefono", ""))
+    texto    = str(body.get("texto", "")).strip()
+    if not _PHONE_RE.match(telefono) or not texto or len(texto) > 4096:
+        raise HTTPException(status_code=400, detail="Datos inválidos")
+    ok, err = await send_whatsapp(telefono, texto)
+    if not ok:
+        raise HTTPException(
+            status_code=502,
+            detail=f"WhatsApp rechazó el mensaje: {err} (fuera de la ventana de 24 h solo se pueden enviar plantillas)",
+        )
+    nombre = (_build_conversations(await _db_rows()).get(telefono) or {}).get("nombre", "")
+    ahora  = datetime.now()
+    await sheets_append(DB_TAB, [
+        str(int(ahora.timestamp() * 1000)), telefono, nombre, "", texto,
+        "'" + ahora.strftime("%Y-%m-%d"), ahora.strftime("%Y-%m-%d %H:%M:%S"), "manual",
+    ])
+    _cache_invalidate(telefono)
+    _db_cache["ts"] = 0
+    return {"ok": True}
+
+@app.post("/api/inbox/mode")
+async def inbox_mode(request: Request):
+    _require_auth(request)
+    body     = await request.json()
+    telefono = body.get("telefono")
+    modo     = body.get("modo")
+    if telefono is None:
+        if modo not in ("manual", "bot"):
+            raise HTTPException(status_code=400, detail="Modo inválido")
+    else:
+        telefono = str(telefono)
+        if not _PHONE_RE.match(telefono) or modo not in ("manual", "bot", "auto"):
+            raise HTTPException(status_code=400, detail="Datos inválidos")
+    try:
+        await set_mode(telefono, modo)
+    except Exception as e:
+        logger.exception("Error cambiando modo")
+        raise HTTPException(status_code=500, detail=f"No se pudo guardar el modo: {e}")
+    _cache_invalidate(telefono or "")
+    return {"ok": True}
