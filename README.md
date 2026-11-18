@@ -24,6 +24,8 @@ render.yaml       ← configuración deploy Render.com
 | `WHATSAPP_VERIFY_TOKEN` | String que tú defines (ej: `almuerzo2024`) |
 | `GOOGLE_SHEETS_ID` | `1mYVizMR567guLlUAkzYyiTdasLL2j2feIyfY37rUTOs` |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | JSON completo de Service Account de Google |
+| `INBOX_PASSWORD` | Contraseña de la bandeja manual `/inbox` (si no se define, la bandeja queda deshabilitada) |
+| `SESSION_SECRET` | Secreto para firmar la cookie de sesión (Render lo genera solo) |
 
 ---
 
@@ -73,3 +75,22 @@ id | telefono | nombre_usuario | mensaje_recibido | respuesta_bot | fecha_contac
 | `GET` | `/` | Health check |
 | `GET` | `/webhook` | Verificación Meta |
 | `POST` | `/webhook` | Recibe mensajes WhatsApp |
+
+---
+
+## Bandeja manual (`/inbox`)
+
+Interfaz web para conversar a mano con quienes escriben al WhatsApp.
+
+- **Tomar control** por contacto: el bot deja de responderle y sus mensajes quedan en la bandeja ("sin responder"). **Devolver al bot** reactiva la respuesta automática.
+- **Todo en manual** (interruptor global): el bot no responde a nadie. Al cambiarlo se reinician los controles individuales.
+- Las respuestas manuales se guardan en `AlmuerzoBot_DB` (columna `msg_id` = `manual`) y el bot las ve como contexto al retomar.
+- El estado manual/automático se guarda en la hoja `AlmuerzoBot_Control` (se crea sola al iniciar; la service account necesita permiso de editor).
+- WhatsApp solo permite texto libre dentro de las 24 h posteriores al último mensaje del cliente.
+
+### Dominio `bot.almuerzo.cl`
+
+1. Render → servicio → Settings → Custom Domains → agregar `bot.almuerzo.cl`.
+2. En el DNS de almuerzo.cl crear un `CNAME` `bot` → `<servicio>.onrender.com`.
+3. Esperar el certificado HTTPS automático y entrar a `https://bot.almuerzo.cl/inbox`.
+4. (Opcional) Actualizar el webhook en Meta a `https://bot.almuerzo.cl/webhook`.

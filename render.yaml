@@ -19,3 +19,7 @@ services:
         value: 1mYVizMR567guLlUAkzYyiTdasLL2j2feIyfY37rUTOs
       - key: GOOGLE_SERVICE_ACCOUNT_JSON
         sync: false
+      - key: INBOX_PASSWORD
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
