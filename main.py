@@ -40,7 +40,11 @@ DB_TAB         = "AlmuerzoBot_DB"
 
 MARCA_LIMITE = "[LÍMITE ALCANZADO]"
 MARCA_MANUAL = "[MANUAL]"
+MARCA_FALLO  = "[ENTREGA FALLIDA]"
 MARCAS       = {MARCA_LIMITE, MARCA_MANUAL}
+
+def _es_marca(texto: str) -> bool:
+    return texto in MARCAS or texto.startswith(MARCA_FALLO)
 
 CONTEXT_WINDOW    = 10
 LIMIT_COMENSAL    = 5
@@ -348,7 +352,7 @@ async def get_user_data(telefono: str) -> dict:
             if (fecha_idx is not None and len(r) > fecha_idx
                 and r[fecha_idx].lstrip("'") == hoy
                 and len(r) > msg_idx and r[msg_idx]
-                and (len(r) <= bot_idx or r[bot_idx] not in MARCAS))
+                and (len(r) <= bot_idx or not _es_marca(r[bot_idx])))
         )
 
         user_only_text = " ".join(
@@ -362,7 +366,7 @@ async def get_user_data(telefono: str) -> dict:
             bot = r[bot_idx] if len(r) > bot_idx else ""
             if msg:
                 messages.append({"role": "user",      "content": msg})
-            if bot and bot not in MARCAS:
+            if bot and not _es_marca(bot):
                 messages.append({"role": "assistant", "content": bot})
         while messages and messages[0]["role"] != "user":
             messages.pop(0)
@@ -411,6 +415,26 @@ async def reply_non_text(telefono: str):
     if await is_manual(telefono):
         return
     await send_whatsapp(telefono, "Solo puedo responder mensajes de texto por ahora 🙏")
+
+async def record_delivery_failure(st: dict):
+    """WhatsApp acepta el envío (200) y luego informa fallas de entrega por webhook (statuses)."""
+    try:
+        err    = (st.get("errors") or [{}])[0]
+        detail = err.get("error_data", {}).get("details") or err.get("message") or err.get("title") or "sin detalle"
+        code   = err.get("code", "?")
+        tel    = st.get("recipient_id", "")
+        logger.error(f"[{tel}] Entrega fallida ({code}): {detail}")
+        if not tel:
+            return
+        ahora = datetime.now()
+        await sheets_append(DB_TAB, [
+            str(int(ahora.timestamp() * 1000)), tel, "", "",
+            f"{MARCA_FALLO} ({code}) {detail}",
+            "'" + ahora.strftime("%Y-%m-%d"), ahora.strftime("%Y-%m-%d %H:%M:%S"), st.get("id", ""),
+        ])
+        _db_cache["ts"] = 0
+    except Exception:
+        logger.exception("Error registrando falla de entrega")
 
 # ── Background task ────────────────────────────────────────────────────────────
 async def process_message(msg: dict, value: dict):
@@ -532,6 +556,10 @@ async def receive(request: Request, background_tasks: BackgroundTasks):
         value    = changes["value"]
         messages = value.get("messages", [])
 
+        for st in value.get("statuses", []):
+            if st.get("status") == "failed":
+                background_tasks.add_task(record_delivery_failure, st)
+
         if not messages:
             return {"status": "no_messages"}
 
@@ -619,6 +647,9 @@ def _build_conversations(rows: list) -> dict:
         if bot == MARCA_LIMITE:
             c["eventos"].append({"dir": "out", "origen": "sistema",
                                  "texto": "Límite diario alcanzado (mensaje automático enviado)", "hora": hora})
+        elif bot.startswith(MARCA_FALLO):
+            c["eventos"].append({"dir": "out", "origen": "sistema",
+                                 "texto": "⚠️ No se entregó un mensaje: " + bot[len(MARCA_FALLO):].strip(), "hora": hora})
         elif bot and bot != MARCA_MANUAL:
             c["eventos"].append({"dir": "out", "origen": "manual" if g(7) == "manual" else "bot",
                                  "texto": bot, "hora": hora})
