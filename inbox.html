@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>AlmuerzoBot · Bandeja</title>
+<style>
+  :root{
+    --bg:#f4f5f7; --panel:#fff; --line:#e3e5e9; --text:#1c1e21; --muted:#6b7280;
+    --accent:#e8590c; --accent-t:#fff; --in:#fff; --out:#dcf8c6; --bot:#e7eefc; --warn:#b45309; --danger:#b91c1c;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{--bg:#111316; --panel:#1a1d21; --line:#2a2e34; --text:#e6e8eb; --muted:#9aa1ab;
+      --in:#242830; --out:#1f4d36; --bot:#223049; --warn:#f59e0b; --danger:#f87171}
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text)}
+  button{font:inherit;cursor:pointer}
+  .hidden{display:none!important}
+
+  /* login */
+  #login{min-height:100%;display:grid;place-items:center;padding:16px}
+  #login form{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:24px;width:100%;max-width:340px;display:grid;gap:12px}
+  #login h1{margin:0;font-size:20px}
+  input[type=password],textarea{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;width:100%}
+  .btn{background:var(--accent);color:var(--accent-t);border:0;border-radius:8px;padding:10px 14px;font-weight:600}
+  .btn.ghost{background:transparent;color:var(--text);border:1px solid var(--line);font-weight:500}
+  .btn.small{padding:6px 10px;font-size:13px}
+  .btn:disabled{opacity:.5;cursor:default}
+  .err{color:var(--danger);font-size:13px;min-height:1em}
+
+  /* app */
+  #app{height:100%;display:grid;grid-template-columns:340px 1fr;grid-template-rows:auto 1fr}
+  header{grid-column:1/-1;display:flex;align-items:center;gap:12px;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
+  header h1{margin:0;font-size:17px;flex:1}
+  .switch{display:flex;align-items:center;gap:8px;font-size:13px}
+  .switch input{width:18px;height:18px;accent-color:var(--accent)}
+  #banner{grid-column:1/-1;background:#fef3c7;color:#78350f;padding:8px 16px;font-size:13px}
+
+  #list{background:var(--panel);border-right:1px solid var(--line);overflow:auto}
+  .conv{display:block;width:100%;text-align:left;background:none;border:0;border-bottom:1px solid var(--line);padding:12px 16px;color:inherit}
+  .conv:hover,.conv.sel{background:var(--bg)}
+  .conv .row{display:flex;justify-content:space-between;gap:8px}
+  .conv .name{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .conv .time{color:var(--muted);font-size:12px;white-space:nowrap}
+  .conv .last{color:var(--muted);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .tag{font-size:11px;border-radius:999px;padding:1px 8px;margin-left:6px;font-weight:600}
+  .tag.manual{background:var(--accent);color:var(--accent-t)}
+  .tag.wait{background:var(--warn);color:#fff}
+  .empty{padding:24px;color:var(--muted);text-align:center}
+
+  #chat{display:flex;flex-direction:column;min-width:0;min-height:0}
+  #chathead{display:flex;align-items:center;gap:10px;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
+  #chathead .t{flex:1;min-width:0}
+  #chathead .t b{display:block}
+  #chathead .t span{color:var(--muted);font-size:13px}
+  #back{display:none}
+  #msgs{flex:1;overflow:auto;padding:16px;display:flex;flex-direction:column;gap:8px}
+  .m{max-width:75%;padding:8px 12px;border-radius:12px;background:var(--in);border:1px solid var(--line);white-space:pre-wrap;word-wrap:break-word}
+  .m.out{align-self:flex-end;background:var(--out)}
+  .m.bot{align-self:flex-end;background:var(--bot)}
+  .m.sistema{align-self:center;background:none;border:0;color:var(--muted);font-size:12px}
+  .m small{display:block;color:var(--muted);font-size:11px;margin-top:2px}
+  #compose{display:flex;gap:8px;padding:10px 16px;background:var(--panel);border-top:1px solid var(--line);align-items:flex-end}
+  #compose textarea{resize:none;max-height:140px}
+  #hint{padding:6px 16px;font-size:12px;color:var(--muted);background:var(--panel)}
+  #placeholder{flex:1;display:grid;place-items:center;color:var(--muted)}
+
+  @media (max-width:760px){
+    #app{grid-template-columns:1fr}
+    #chat{display:none}
+    #app.open #list{display:none}
+    #app.open #chat{display:flex}
+    #back{display:inline-block}
+    .m{max-width:88%}
+  }
+</style>
+</head>
+<body>
+
+<div id="login" class="hidden">
+  <form id="loginForm">
+    <h1>AlmuerzoBot · Bandeja</h1>
+    <input type="password" id="pw" placeholder="Contraseña" autocomplete="current-password" required autofocus>
+    <div class="err" id="loginErr"></div>
+    <button class="btn" type="submit">Entrar</button>
+  </form>
+</div>
+
+<div id="app" class="hidden">
+  <header>
+    <h1>AlmuerzoBot · Bandeja</h1>
+    <label class="switch" title="Con esto activo el bot no responde a nadie; todos los chats quedan para usted">
+      <input type="checkbox" id="globalManual"> Todo en manual
+    </label>
+    <button class="btn ghost small" id="logout">Salir</button>
+  </header>
+  <div id="banner" class="hidden"></div>
+
+  <aside id="list"></aside>
+
+  <section id="chat">
+    <div id="placeholder">Seleccione una conversación</div>
+    <div id="chatwrap" class="hidden" style="display:none;flex-direction:column;flex:1;min-height:0">
+      <div id="chathead">
+        <button class="btn ghost small" id="back">←</button>
+        <div class="t"><b id="cname"></b><span id="cphone"></span></div>
+        <button class="btn small" id="toggleMode"></button>
+      </div>
+      <div id="msgs"></div>
+      <div id="hint"></div>
+      <form id="compose">
+        <textarea id="text" rows="1" placeholder="Escribir respuesta…"></textarea>
+        <button class="btn" id="send" type="submit">Enviar</button>
+      </form>
+    </div>
+  </section>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let current = null, convs = [], currentManual = false, busy = false;
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, {
+    credentials: 'same-origin',
+    headers: {'Content-Type': 'application/json'},
+    ...opts,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  if (r.status === 401) { showLogin(); throw new Error('no-auth'); }
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.detail || ('Error ' + r.status));
+  return data;
+}
+
+function showLogin() { $('#app').classList.add('hidden'); $('#login').classList.remove('hidden'); }
+function showApp()   { $('#login').classList.add('hidden'); $('#app').classList.remove('hidden'); }
+
+$('#loginForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  $('#loginErr').textContent = '';
+  try {
+    await api('/api/inbox/login', {method: 'POST', body: {password: $('#pw').value}});
+    $('#pw').value = '';
+    showApp(); refresh();
+  } catch (err) { if (err.message !== 'no-auth') $('#loginErr').textContent = err.message; }
+});
+$('#logout').addEventListener('click', async () => { await api('/api/inbox/logout', {method:'POST'}).catch(()=>{}); showLogin(); });
+
+function fmtTime(h) { return h ? h.slice(5, 16).replace('-', '/') : ''; }
+
+function renderList() {
+  const el = $('#list');
+  el.replaceChildren();
+  if (!convs.length) { const d = document.createElement('div'); d.className = 'empty'; d.textContent = 'Aún no hay conversaciones'; el.append(d); return; }
+  for (const c of convs) {
+    const b = document.createElement('button');
+    b.className = 'conv' + (c.telefono === current ? ' sel' : '');
+    const row = document.createElement('div'); row.className = 'row';
+    const name = document.createElement('span'); name.className = 'name';
+    name.textContent = c.nombre || c.telefono;
+    if (c.sin_responder) { const t = document.createElement('span'); t.className = 'tag wait'; t.textContent = 'sin responder'; name.append(t); }
+    else if (c.manual)   { const t = document.createElement('span'); t.className = 'tag manual'; t.textContent = 'manual'; name.append(t); }
+    const time = document.createElement('span'); time.className = 'time'; time.textContent = fmtTime(c.hora);
+    row.append(name, time);
+    const last = document.createElement('div'); last.className = 'last'; last.textContent = c.ultimo;
+    b.append(row, last);
+    b.addEventListener('click', () => openChat(c.telefono));
+    el.append(b);
+  }
+}
+
+async function refresh() {
+  try {
+    const d = await api('/api/inbox/conversations');
+    convs = d.conversaciones;
+    $('#globalManual').checked = d.global_manual;
+    const bn = $('#banner');
+    bn.classList.toggle('hidden', d.control_ok);
+    if (!d.control_ok) bn.textContent = 'No se pudo cargar la hoja de control: el bot sigue en automático y no se puede cambiar el modo hasta que se recupere.';
+    renderList();
+    if (current) loadChat(false);
+  } catch (e) {}
+}
+
+async function openChat(tel) {
+  current = tel;
+  $('#app').classList.add('open');
+  renderList();
+  await loadChat(true);
+}
+
+async function loadChat(scroll) {
+  if (!current) return;
+  try {
+    const c = await api('/api/inbox/conversations/' + current);
+    $('#placeholder').style.display = 'none';
+    const w = $('#chatwrap'); w.classList.remove('hidden'); w.style.display = 'flex';
+    $('#cname').textContent = c.nombre || c.telefono;
+    $('#cphone').textContent = '+' + c.telefono;
+    currentManual = c.manual;
+    const tm = $('#toggleMode');
+    tm.textContent = c.manual ? 'Devolver al bot' : 'Tomar control';
+    $('#hint').textContent = c.manual
+      ? 'Modo manual: el bot no responde a este contacto. WhatsApp solo permite texto libre dentro de las 24 h desde su último mensaje.'
+      : 'El bot responde automáticamente. Si escribe aquí, tome el control para que el bot no se cruce.';
+    const box = $('#msgs');
+    const atBottom = scroll || box.scrollHeight - box.scrollTop - box.clientHeight < 60;
+    box.replaceChildren();
+    for (const ev of c.eventos) {
+      const d = document.createElement('div');
+      d.className = 'm ' + (ev.dir === 'in' ? '' : ev.origen === 'manual' ? 'out' : ev.origen === 'sistema' ? 'sistema' : 'bot');
+      d.textContent = ev.texto;
+      if (ev.origen !== 'sistema') {
+        const s = document.createElement('small');
+        s.textContent = (ev.dir === 'in' ? '' : ev.origen === 'manual' ? 'Usted · ' : 'Bot · ') + fmtTime(ev.hora);
+        d.append(s);
+      }
+      box.append(d);
+    }
+    if (atBottom) box.scrollTop = box.scrollHeight;
+  } catch (e) {}
+}
+
+$('#toggleMode').addEventListener('click', async () => {
+  if (!current) return;
+  try {
+    await api('/api/inbox/mode', {method: 'POST', body: {telefono: current, modo: currentManual ? 'bot' : 'manual'}});
+    await refresh(); await loadChat(false);
+  } catch (e) { alert(e.message); }
+});
+
+$('#globalManual').addEventListener('change', async e => {
+  const manual = e.target.checked;
+  if (!confirm(manual
+      ? 'Todos los chats quedarán en manual: el bot no responderá a nadie. ¿Continuar?'
+      : 'Se devuelve el control al bot para todos los chats. ¿Continuar?')) { e.target.checked = !manual; return; }
+  try { await api('/api/inbox/mode', {method: 'POST', body: {telefono: null, modo: manual ? 'manual' : 'bot'}}); refresh(); }
+  catch (err) { alert(err.message); e.target.checked = !manual; }
+});
+
+$('#compose').addEventListener('submit', async e => {
+  e.preventDefault();
+  const t = $('#text').value.trim();
+  if (!t || !current || busy) return;
+  busy = true; $('#send').disabled = true;
+  try {
+    await api('/api/inbox/send', {method: 'POST', body: {telefono: current, texto: t}});
+    $('#text').value = ''; $('#text').style.height = '';
+    await loadChat(true); refresh();
+  } catch (err) { alert(err.message); }
+  busy = false; $('#send').disabled = false;
+});
+$('#text').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); $('#compose').requestSubmit(); }
+});
+$('#text').addEventListener('input', e => { e.target.style.height = 'auto'; e.target.style.height = e.target.scrollHeight + 'px'; });
+$('#back').addEventListener('click', () => { $('#app').classList.remove('open'); current = null; renderList(); });
+
+(async () => {
+  try { await api('/api/inbox/conversations'); showApp(); refresh(); }
+  catch (e) { if (e.message !== 'no-auth') showLogin(); }
+  setInterval(() => { if (!document.hidden && !$('#app').classList.contains('hidden')) refresh(); }, 6000);
+})();
+</script>
+</body>
+</html>
